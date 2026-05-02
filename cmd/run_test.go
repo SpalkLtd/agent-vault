@@ -16,7 +16,7 @@ import (
 // the other is a bug. `vault` is inherited from vaultCmd's persistent flags
 // on `vault run` and registered locally on the top-level `run`.
 var expectedRunFlags = []string{
-	"address", "role", "ttl", "no-mitm", "vault",
+	"address", "role", "ttl", "vault",
 	"isolation", "image", "mount", "keep", "no-firewall",
 	"home-volume-shared", "share-agent-dir",
 }
@@ -86,6 +86,35 @@ func TestAugmentEnvWithMITM_Disabled(t *testing.T) {
 	}
 	if _, err := os.Stat(caPath); !os.IsNotExist(err) {
 		t.Errorf("expected no CA file on 404, stat err=%v", err)
+	}
+}
+
+func TestRequireMITMEnv_DisabledIsFatal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	caPath := filepath.Join(t.TempDir(), "mitm-ca.pem")
+	_, _, err := requireMITMEnv(nil, srv.URL, "tok", "v", caPath)
+	if err == nil {
+		t.Fatal("expected fatal error when server has MITM disabled")
+	}
+	// Operator-facing message must point at the server-side fix.
+	if !strings.Contains(err.Error(), "--mitm-port 0") {
+		t.Errorf("error should reference --mitm-port 0; got: %v", err)
+	}
+}
+
+func TestRequireMITMEnv_TransportFailureIsFatal(t *testing.T) {
+	caPath := filepath.Join(t.TempDir(), "mitm-ca.pem")
+	// Bogus address that will fail to dial.
+	_, _, err := requireMITMEnv(nil, "http://127.0.0.1:1", "tok", "v", caPath)
+	if err == nil {
+		t.Fatal("expected fatal error on transport failure")
+	}
+	if !strings.Contains(err.Error(), "MITM setup failed") {
+		t.Errorf("error should be wrapped with 'MITM setup failed'; got: %v", err)
 	}
 }
 

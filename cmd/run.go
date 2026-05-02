@@ -37,25 +37,23 @@ func newRunCmd(examplePrefix string) *cobra.Command {
 		Long: `Start an agent process (e.g. claude, agent, codex, hermes, opencode) with an Agent Vault session.
 Everything after -- is treated as the command to execute.
 
-Environment variables always set on the child:
+Environment variables set on the child:
   AGENT_VAULT_SESSION_TOKEN  — vault-scoped bearer token for the Agent Vault server
   AGENT_VAULT_ADDR           — base URL of the Agent Vault HTTP control server
   AGENT_VAULT_VAULT          — vault the session is scoped to
 
-When the server's transparent MITM proxy is reachable (default), the child
-also inherits HTTPS_PROXY / NO_PROXY / NODE_USE_ENV_PROXY plus the root CA trust
-variables (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE,
-GIT_SSL_CAINFO, DENO_CERT) so standard HTTPS clients transparently route through the
-broker. NODE_USE_ENV_PROXY=1 enables Node.js built-in proxy support (v22.21.0+) so
-fetch() and https.get() honor HTTPS_PROXY natively. HTTP_PROXY is intentionally not set — the MITM proxy only handles
-HTTPS (CONNECT) and would 405 any plain http:// request. The root CA PEM
-is written to ~/.agent-vault/mitm-ca.pem. Pass --no-mitm to disable
-injection and rely solely on the explicit /proxy/{host}/{path} endpoint.
+The child also inherits HTTPS_PROXY / NO_PROXY / NODE_USE_ENV_PROXY plus
+the root CA trust variables (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS,
+REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO, DENO_CERT) so standard
+HTTPS clients transparently route through the broker. NODE_USE_ENV_PROXY=1
+enables Node.js built-in proxy support (v22.21.0+) so fetch() and
+https.get() honor HTTPS_PROXY natively. HTTP_PROXY is intentionally not
+set — the MITM proxy only handles HTTPS (CONNECT) and would 405 any plain
+http:// request. The root CA PEM is written to ~/.agent-vault/mitm-ca.pem.
 
 Example:
   ` + examplePrefix + ` -- claude
-  ` + examplePrefix + ` --vault myproject -- claude
-  ` + examplePrefix + ` --no-mitm -- claude`,
+  ` + examplePrefix + ` --vault myproject -- claude`,
 		Args:                  cobra.MinimumNArgs(1),
 		DisableFlagsInUseLine: true,
 		RunE:                  runCmdRunE,
@@ -67,7 +65,6 @@ Example:
 	c.Flags().String("address", "", "Agent Vault server address (defaults to session address)")
 	c.Flags().String("role", "", "Vault role for the agent session (proxy, member, admin; default: proxy)")
 	c.Flags().Int("ttl", 0, "Session TTL in seconds (300–604800; default: server default 24h)")
-	c.Flags().Bool("no-mitm", false, "Skip HTTPS_PROXY/CA env injection for the child (explicit /proxy only)")
 
 	c.Flags().String("image", "", "Container image override (requires --isolation=container)")
 	c.Flags().StringArray("mount", nil, "Extra bind mount src:dst[:ro] (repeatable; requires --isolation=container)")
@@ -140,19 +137,14 @@ func runCmdRunE(cmd *cobra.Command, args []string) error {
 	)
 
 	// 6. Route the child's HTTPS traffic through the transparent MITM
-	//    proxy. Explicit /proxy stays available as a fallback.
-	if noMITM, _ := cmd.Flags().GetBool("no-mitm"); !noMITM {
-		newEnv, mitmPort, ok, err := augmentEnvWithMITM(env, addr, scopedToken, vault, "")
-		switch {
-		case err != nil:
-			fmt.Fprintf(os.Stderr, "agent-vault: MITM setup failed (%v); continuing with explicit proxy only\n", err)
-		case !ok:
-			fmt.Fprintln(os.Stderr, "agent-vault: MITM proxy disabled on server; using explicit proxy only")
-		default:
-			env = newEnv
-			fmt.Fprintf(os.Stderr, "%s routing HTTPS through MITM proxy (127.0.0.1:%d)\n", successText("agent-vault:"), mitmPort)
-		}
+	//    proxy. The MITM ingress is the only credential-injection path,
+	//    so a failure here is fatal.
+	newEnv, mitmPort, err := requireMITMEnv(env, addr, scopedToken, vault, "")
+	if err != nil {
+		return err
 	}
+	env = newEnv
+	fmt.Fprintf(os.Stderr, "%s routing HTTPS through MITM proxy (127.0.0.1:%d)\n", successText("agent-vault:"), mitmPort)
 
 	// 7. If the target command is a supported agent, offer to install the
 	//    Agent Vault skill (only when not already present).
@@ -373,6 +365,20 @@ func stripEnvKeys(env []string, keys map[string]struct{}) []string {
 		out = append(out, kv)
 	}
 	return out
+}
+
+// requireMITMEnv calls augmentEnvWithMITM and converts both transport
+// failures and a server-side --mitm-port 0 into actionable errors.
+// MITM is the only ingress, so neither case is recoverable for vault run.
+func requireMITMEnv(env []string, addr, token, vault, caPath string) ([]string, int, error) {
+	newEnv, port, ok, err := augmentEnvWithMITM(env, addr, token, vault, caPath)
+	if err != nil {
+		return env, 0, fmt.Errorf("MITM setup failed: %w", err)
+	}
+	if !ok {
+		return env, 0, errors.New("MITM proxy is disabled on the Agent Vault server; restart the server without --mitm-port 0 to enable it")
+	}
+	return newEnv, port, nil
 }
 
 // augmentEnvWithMITM extends env so the child transparently routes HTTPS
