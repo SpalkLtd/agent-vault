@@ -2,6 +2,8 @@
 
 A reverse proxy that exposes Agent Vault's management UI (port `14321`) on the public internet while keeping the MITM proxy (port `14322`) on the private network. Platform-agnostic — works wherever Docker runs.
 
+This is a working starting point, not a maximally hardened production config. It gets the structural pieces right (no route to `14322`, `CONNECT` refused, sane keepalive and header handling) and leaves rate limits, source-IP allowlists, body-size caps, and TLS termination as adapt-it-yourself — see [Adapt](#adapt).
+
 ## Why
 
 Agent Vault binds two ports on the same host:
@@ -26,6 +28,10 @@ PUBLIC INTERNET                              PRIVATE NETWORK
                                                [agent service]   [external APIs]
                                                                   (creds injected)
 ```
+
+## Prerequisite
+
+This example assumes port `14322` is unreachable from the public internet — by deploying Agent Vault as a private PaaS service, by firewall, or by binding `14322` to a private interface. **nginx is the public facade; the network is the lock.** If `14322` has a public route, this reverse proxy adds nothing.
 
 ## Run it locally
 
@@ -63,7 +69,7 @@ Set these on the upstream Agent Vault service so it behaves correctly behind a r
 
 | Attack | What stops it |
 |--------|---------------|
-| Public traffic to port `14322` | The reverse proxy has no route there. The `proxy_pass` only ever points at `14321`. |
+| `14322` reached *via* the reverse proxy | nginx has no route there — `proxy_pass` only ever points at `14321`. (Direct public reach to `14322` is stopped by the network, not nginx — see [Prerequisite](#prerequisite).) |
 | `CONNECT` tunneling through the reverse proxy | Explicit `return 405` on `CONNECT`. |
 
 The config also strips `X-Forwarded-User` and `X-Auth-Request-User` preemptively. Agent Vault doesn't trust these headers today, but stripping prevents a client from arriving pre-authed if a future version grows oauth2-proxy-style trusted-header support before this config is reviewed.
