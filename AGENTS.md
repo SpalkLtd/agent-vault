@@ -17,8 +17,6 @@ Agent Vault is an HTTP proxy that attaches credentials to your outbound requests
 | `AGENT_VAULT_TOKEN` | Bearer token for authenticating with Agent Vault. Either a vault-scoped session token or a long-lived agent token. |
 | `AGENT_VAULT_VAULT` | Vault the session is scoped to |
 
-> `AGENT_VAULT_SESSION_TOKEN` is the deprecated alias of `AGENT_VAULT_TOKEN` and is still honored.
-
 ## The X-Vault header
 
 If you received your token via an agent invite (instance-level agent token), you must include `X-Vault: {vault_name}` on all control-plane requests (`/discover`, `/v1/proposals`). If `AGENT_VAULT_VAULT` is set, use that value. Vault-scoped sessions (from `vault run`) do not need this header. Proxied requests don't use `X-Vault` either — vault for proxy traffic is communicated via the `Proxy-Authorization` userinfo (`token:vault`) baked into `HTTPS_PROXY`/`HTTP_PROXY`, which `vault run` configures for you.
@@ -48,7 +46,7 @@ GET https://api.stripe.com/v1/charges
 If you have vault admin role, you can add or remove services without proposals:
 
 ```
-POST {AGENT_VAULT_ADDR}/v1/vaults/{vault_name}/services    -- upsert services by name (body: {"services": [...]}). Each entry must include both `name` (canonical slug) and `host` (accepts inline path form like `slack.com/api/*`).
+POST {AGENT_VAULT_ADDR}/v1/vaults/{vault_name}/services    -- upsert services by name (body: {"services": [...]}). Each entry must include `host` (accepts inline path form like `slack.com/api/*`) and `name` (canonical slug) — `name` may be omitted only when `host` uniquely matches an existing service in the vault, in which case the server adopts that entry's name.
 DELETE {AGENT_VAULT_ADDR}/v1/vaults/{vault_name}/services/{name}  -- remove a service. The slot also accepts a host as a back-compat shim, returning 409 with the candidate names when more than one service shares that host.
 ```
 

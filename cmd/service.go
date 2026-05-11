@@ -152,7 +152,9 @@ If a service with the same name already exists, it is replaced.
 (*.github.com), or an inline path-scoped form (slack.com/api/*) — the
 broker splits the path off the host on ingest.
 
-Flag-driven mode (--name and --host are both required):
+Flag-driven mode. --host is required; --name is required for new services
+(the server adopts the existing name when --host uniquely matches an entry
+already in the vault — same pattern as 'service remove' by host):
   agent-vault vault service add --name stripe --host api.stripe.com --auth-type bearer --token-key STRIPE_KEY
   agent-vault vault service add --name slack-bot --host 'slack.com/api/*' --auth-type bearer --token-key SLACK_BOT_TOKEN
 
@@ -189,9 +191,6 @@ File mode (upsert, not replace-all):
 			}
 
 			name, _ := cmd.Flags().GetString("name")
-			if name == "" {
-				return fmt.Errorf("--name is required when --host is specified")
-			}
 
 			host, path := broker.SplitInlineHost(host, "")
 
@@ -402,7 +401,7 @@ func init() {
 
 	// service add flags
 	serviceAddCmd.Flags().StringP("file", "f", "", "Path to services YAML file (upsert mode)")
-	serviceAddCmd.Flags().String("name", "", "Service name (slug, 3–64 lowercase alphanumeric/hyphen chars). Required with --host.")
+	serviceAddCmd.Flags().String("name", "", "Service name (slug, 3–64 lowercase alphanumeric/hyphen chars). Required for new services; may be omitted when --host uniquely matches an existing service (the server adopts that name).")
 	serviceAddCmd.Flags().String("host", "", "Target service host. Accepts api.stripe.com, *.github.com, or inline path form like slack.com/api/*.")
 	serviceAddCmd.Flags().String("auth-type", "", "Auth type: bearer, basic, api-key, custom, passthrough")
 	serviceAddCmd.Flags().String("token-key", "", "Credential key for bearer auth")

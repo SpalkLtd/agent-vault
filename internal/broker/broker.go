@@ -613,6 +613,135 @@ func matchPathGlob(pattern, path string) (literalLen int, ok bool) {
 	return literalLen, true
 }
 
+// Slugify derives a ValidateSlug-conformant identifier from host+path.
+// Distinct inputs can collide (e.g. `*.github.com` and `github.com` both
+// yield `github-com`); callers dedupe via DisambiguateSlug.
+func Slugify(host, path string) string {
+	var b strings.Builder
+	write := func(s string) {
+		for _, r := range strings.ToLower(s) {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('-')
+			}
+		}
+	}
+	write(host)
+	write(path)
+	raw := b.String()
+	for strings.Contains(raw, "--") {
+		raw = strings.ReplaceAll(raw, "--", "-")
+	}
+	raw = strings.Trim(raw, "-")
+	if len(raw) > 64 {
+		raw = strings.TrimRight(raw[:64], "-")
+	}
+	if len(raw) < 3 {
+		if raw == "" {
+			return "svc"
+		}
+		return raw + "-svc"
+	}
+	return raw
+}
+
+// AssignSlugNames is AssignSlugNamesAvoiding with no existing-state
+// context — intra-slice disambiguation only. Use this on read paths
+// or full-replace writes where no pre-existing services are merged
+// against.
+func AssignSlugNames(services []Service) {
+	AssignSlugNamesAvoiding(services, nil)
+}
+
+// AssignSlugNamesAvoiding fills empty Names with awareness of an
+// existing vault state:
+//
+//  1. An empty-Name entry whose (Host, Path) uniquely matches an
+//     existing service adopts that service's Name.
+//  2. Remaining empties auto-slug via Slugify + DisambiguateSlug,
+//     reserving existing Names alongside in-slice Names so a cross-
+//     host slug collision lands on a -2 suffix.
+//
+// Pass nil existing for intra-slice disambiguation only.
+//
+// Server write paths route through handle_services.adoptByHost
+// instead — that helper rejects empty Names with no unique host
+// match rather than auto-slugging. The (2) reservation branch here
+// is therefore defensive: production callers (read-path heals via
+// AssignSlugNames(svcs)) pass nil existing, so it isn't reached.
+// Kept for documentation + the broker-level unit tests that pin the
+// semantics if a future caller wants the full adopt-then-slug heal.
+func AssignSlugNamesAvoiding(services, existing []Service) {
+	anyEmpty := false
+	for _, s := range services {
+		if s.Name == "" {
+			anyEmpty = true
+			break
+		}
+	}
+	if !anyEmpty {
+		return
+	}
+
+	type hp struct{ host, path string }
+	hpCount := make(map[hp]int, len(existing))
+	hpName := make(map[hp]string, len(existing))
+	for _, e := range existing {
+		k := hp{e.Host, e.Path}
+		hpCount[k]++
+		if hpCount[k] == 1 {
+			hpName[k] = e.Name
+		}
+	}
+	for i := range services {
+		svc := &services[i]
+		if svc.Name != "" {
+			continue
+		}
+		k := hp{svc.Host, svc.Path}
+		if hpCount[k] == 1 {
+			svc.Name = hpName[k]
+		}
+	}
+
+	taken := make(map[string]bool, len(services)+len(existing))
+	for _, e := range existing {
+		if e.Name != "" {
+			taken[e.Name] = true
+		}
+	}
+	for _, s := range services {
+		if s.Name != "" {
+			taken[s.Name] = true
+		}
+	}
+	for i := range services {
+		svc := &services[i]
+		if svc.Name != "" {
+			continue
+		}
+		svc.Name = DisambiguateSlug(Slugify(svc.Host, svc.Path), taken)
+		taken[svc.Name] = true
+	}
+}
+
+// DisambiguateSlug returns the lowest `base-<n>` (n≥2) not in taken,
+// truncating base to stay within the 64-char ValidateSlug cap.
+func DisambiguateSlug(base string, taken map[string]bool) string {
+	name := base
+	for n := 2; taken[name]; n++ {
+		suffix := fmt.Sprintf("-%d", n)
+		trunc := base
+		if len(trunc)+len(suffix) > 64 {
+			trunc = strings.TrimRight(trunc[:64-len(suffix)], "-")
+		}
+		name = trunc + suffix
+	}
+	return name
+}
+
 // ValidateSlug enforces the per-vault identifier rule shared by vault,
 // agent, and service names: 3–64 chars, lowercase ASCII alphanumeric
 // and hyphens, no leading/trailing or consecutive hyphens.

@@ -171,6 +171,143 @@ func TestValidateSlugRejects(t *testing.T) {
 	}
 }
 
+func TestSlugify(t *testing.T) {
+	cases := []struct {
+		name, host, path, want string
+	}{
+		{"plain host", "api.anthropic.com", "", "api-anthropic-com"},
+		{"host plus path", "slack.com", "/api/*", "slack-com-api"},
+		{"host plus literal path", "slack.com", "/api/apps.connections.*", "slack-com-api-apps-connections"},
+		{"wildcard host", "*.github.com", "", "github-com"},
+		{"wildcard host with path", "*.github.com", "/repos/*", "github-com-repos"},
+		{"underscores in path", "api.example.com", "/v1/foo_bar", "api-example-com-v1-foo-bar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Slugify(tc.host, tc.path)
+			if got != tc.want {
+				t.Fatalf("Slugify(%q, %q) = %q, want %q", tc.host, tc.path, got, tc.want)
+			}
+			if err := ValidateSlug(got); err != nil {
+				t.Fatalf("Slugify output %q failed ValidateSlug: %v", got, err)
+			}
+		})
+	}
+}
+
+func TestSlugifyTruncatesAndStaysValid(t *testing.T) {
+	long := strings.Repeat("a.", 100) + "com"
+	got := Slugify(long, "")
+	if len(got) > 64 {
+		t.Fatalf("expected truncation, got %d chars", len(got))
+	}
+	if err := ValidateSlug(got); err != nil {
+		t.Fatalf("truncated slug %q failed ValidateSlug: %v", got, err)
+	}
+}
+
+func TestAssignSlugNamesFillsAndDisambiguates(t *testing.T) {
+	svcs := []Service{
+		{Host: "api.anthropic.com"},
+		{Host: "slack.com", Path: "/api/*"},
+		{Host: "slack.com", Path: "/api/apps.connections.*"},
+		{Name: "explicit", Host: "github.com"},
+		{Host: "api.anthropic.com"}, // collides with svcs[0]; expect -2 suffix
+	}
+	AssignSlugNames(svcs)
+
+	want := []string{
+		"api-anthropic-com",
+		"slack-com-api",
+		"slack-com-api-apps-connections",
+		"explicit",
+		"api-anthropic-com-2",
+	}
+	for i, w := range want {
+		if svcs[i].Name != w {
+			t.Errorf("svcs[%d].Name = %q, want %q", i, svcs[i].Name, w)
+		}
+	}
+}
+
+func TestAssignSlugNamesLeavesExplicitUntouched(t *testing.T) {
+	svcs := []Service{{Name: "custom-name", Host: "api.anthropic.com"}}
+	AssignSlugNames(svcs)
+	if svcs[0].Name != "custom-name" {
+		t.Fatalf("expected explicit name to survive, got %q", svcs[0].Name)
+	}
+}
+
+func TestDisambiguateSlug(t *testing.T) {
+	taken := map[string]bool{"foo": true, "foo-2": true}
+	if got := DisambiguateSlug("foo", taken); got != "foo-3" {
+		t.Fatalf("expected foo-3, got %q", got)
+	}
+	if got := DisambiguateSlug("bar", taken); got != "bar" {
+		t.Fatalf("expected unique base to pass through, got %q", got)
+	}
+}
+
+// TestAssignSlugNamesAvoidingAdoptsByHostPath pins that an empty-Name
+// incoming whose (Host, Path) uniquely matches an existing entry
+// adopts that entry's Name instead of auto-slugging.
+func TestAssignSlugNamesAvoidingAdoptsByHostPath(t *testing.T) {
+	existing := []Service{{Name: "stripe-prod", Host: "api.stripe.com"}}
+	incoming := []Service{{Host: "api.stripe.com"}}
+	AssignSlugNamesAvoiding(incoming, existing)
+	if incoming[0].Name != "stripe-prod" {
+		t.Fatalf("expected adopted Name=stripe-prod, got %q", incoming[0].Name)
+	}
+}
+
+// TestAssignSlugNamesAvoidingReservesExistingForCrossHostCollision pins
+// the cross-host collision guard: when Slugify maps the incoming Host to
+// a slug that already names an unrelated existing service (e.g.
+// `github.com` and `*.github.com` both yield `github-com`), the auto-
+// slug lands on a -2 suffix instead of silently replacing.
+func TestAssignSlugNamesAvoidingReservesExistingForCrossHostCollision(t *testing.T) {
+	existing := []Service{{Name: "github-com", Host: "*.github.com"}}
+	incoming := []Service{{Host: "github.com"}}
+	AssignSlugNamesAvoiding(incoming, existing)
+	if incoming[0].Name != "github-com-2" {
+		t.Fatalf("expected disambiguated Name=github-com-2, got %q", incoming[0].Name)
+	}
+}
+
+// TestAssignSlugNamesAvoidingAmbiguousHostPathFallsThrough pins that an
+// ambiguous (Host, Path) — 2+ existing matches with distinct Names —
+// skips the adoption branch and the entry takes the auto-slug path
+// instead. broker.Validate's duplicate-Name check does not catch this
+// shape (different Names, same Host), so the helper's hpCount>1 guard
+// is the load-bearing defense.
+func TestAssignSlugNamesAvoidingAmbiguousHostPathFallsThrough(t *testing.T) {
+	existing := []Service{
+		{Name: "stripe-a", Host: "api.stripe.com"},
+		{Name: "stripe-b", Host: "api.stripe.com"},
+	}
+	incoming := []Service{{Host: "api.stripe.com"}}
+	AssignSlugNamesAvoiding(incoming, existing)
+	// Adoption is skipped; auto-slug to api-stripe-com (neither
+	// stripe-a nor stripe-b collides with that slug).
+	if incoming[0].Name != "api-stripe-com" {
+		t.Fatalf("expected fallthrough Name=api-stripe-com, got %q", incoming[0].Name)
+	}
+}
+
+// TestAssignSlugNamesAvoidingNilExistingMatchesAssignSlugNames pins that
+// passing nil existing reproduces the intra-slice-only behavior of the
+// original AssignSlugNames.
+func TestAssignSlugNamesAvoidingNilExistingMatchesAssignSlugNames(t *testing.T) {
+	svcs := []Service{
+		{Host: "api.anthropic.com"},
+		{Host: "api.anthropic.com"},
+	}
+	AssignSlugNamesAvoiding(svcs, nil)
+	if svcs[0].Name != "api-anthropic-com" || svcs[1].Name != "api-anthropic-com-2" {
+		t.Fatalf("expected api-anthropic-com and api-anthropic-com-2, got %q / %q", svcs[0].Name, svcs[1].Name)
+	}
+}
+
 // --- ValidatePath tests ---
 
 func TestValidatePathHappyPath(t *testing.T) {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -2492,6 +2493,42 @@ func TestDiscoverSuccess(t *testing.T) {
 	// setupVaultWithCredential seeds "STRIPE_KEY" — verify it appears in available_credentials.
 	if len(resp.AvailableCredentials) != 1 || resp.AvailableCredentials[0] != "STRIPE_KEY" {
 		t.Fatalf("expected available_credentials [STRIPE_KEY], got %v", resp.AvailableCredentials)
+	}
+}
+
+// TestDiscoverHealsLegacyUnnamedServices pins that /discover returns
+// auto-slugged Names for legacy entries persisted without `name`.
+// Agents identify services by Name (per skill_http.md); a blank Name
+// here makes the service un-addressable until an unrelated write
+// triggers a heal elsewhere.
+func TestDiscoverHealsLegacyUnnamedServices(t *testing.T) {
+	servicesJSON := `[
+		{"host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_KEY"}},
+		{"host":"api.openai.com","auth":{"type":"bearer","token":"OPENAI_KEY"}}
+	]`
+	ms, token, _ := setupVaultWithCredential(t, servicesJSON)
+	srv := newTestServer(withStore(ms))
+
+	req := httptest.NewRequest(http.MethodGet, "/discover", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp discoverResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Services) != 2 {
+		t.Fatalf("expected 2 services, got %d", len(resp.Services))
+	}
+	if resp.Services[0].Name != "api-anthropic-com" {
+		t.Fatalf("expected services[0].name=api-anthropic-com (auto-slug), got %q", resp.Services[0].Name)
+	}
+	if resp.Services[1].Name != "api-openai-com" {
+		t.Fatalf("expected services[1].name=api-openai-com (auto-slug), got %q", resp.Services[1].Name)
 	}
 }
 
@@ -5263,7 +5300,11 @@ func TestServicesUpsertAddNew(t *testing.T) {
 	}
 }
 
-func TestServicesUpsertRejectsMissingName(t *testing.T) {
+// TestServicesUpsertRejectsMissingNameForNewService pins the
+// "name is required for new services" contract: an empty-Name upsert
+// against an empty vault has no existing entry to adopt by host, so
+// it falls through to broker.Validate which rejects with 400.
+func TestServicesUpsertRejectsMissingNameForNewService(t *testing.T) {
 	ms, token := setupMockStoreWithSession(t)
 	srv := newTestServer(withStore(ms))
 
@@ -5275,10 +5316,10 @@ func TestServicesUpsertRejectsMissingName(t *testing.T) {
 	srv.httpServer.Handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for service missing name, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 400 (name required for new service), got %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "name is required") {
-		t.Fatalf("expected 'name is required' error, got %s", rec.Body.String())
+		t.Fatalf("expected error to mention 'name is required', got %s", rec.Body.String())
 	}
 }
 
@@ -5315,6 +5356,141 @@ func TestServicesUpsertReplaceExisting(t *testing.T) {
 	}
 	if strings.Contains(bc.ServicesJSON, "OLD_KEY") {
 		t.Fatalf("expected OLD_KEY to be replaced, got %s", bc.ServicesJSON)
+	}
+}
+
+// TestServicesUpsertEmptyNameAdoptsExistingByHostPath pins the
+// same-host rename heal: an empty-Name upsert against a service that
+// was renamed (`stripe-prod` for `api.stripe.com`) adopts the existing
+// Name and in-place replaces, instead of appending an unreachable
+// `api-stripe-com` ghost that loses every MatchService tiebreak.
+func TestServicesUpsertEmptyNameAdoptsExistingByHostPath(t *testing.T) {
+	ms, token := setupMockStoreWithSession(t)
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		ID: "bc-1", VaultID: "root-ns-id",
+		ServicesJSON: `[{"name":"stripe-prod","host":"api.stripe.com","auth":{"type":"bearer","token":"OLD_KEY"}}]`,
+	}
+	srv := newTestServer(withStore(ms))
+
+	body := `{"services":[{"host":"api.stripe.com","auth":{"type":"bearer","token":"NEW_KEY"}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/default/services", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp["services_count"].(float64) != 1 {
+		t.Fatalf("expected in-place replace (services_count=1), got %v — would be a ghost service", resp["services_count"])
+	}
+	upserted := resp["upserted"].([]interface{})
+	if len(upserted) != 1 || upserted[0] != "stripe-prod" {
+		t.Fatalf("expected upserted=[stripe-prod] (adopted), got %v", upserted)
+	}
+	bc := ms.brokerConfigs["root-ns-id"]
+	if !strings.Contains(bc.ServicesJSON, "NEW_KEY") || strings.Contains(bc.ServicesJSON, "OLD_KEY") {
+		t.Fatalf("expected token rotated to NEW_KEY, got %s", bc.ServicesJSON)
+	}
+	if strings.Contains(bc.ServicesJSON, "api-stripe-com") {
+		t.Fatalf("expected no auto-slugged ghost entry, got %s", bc.ServicesJSON)
+	}
+}
+
+// TestServicesUpsertEmptyNameDoesNotReplaceUnrelatedExisting pins
+// that an empty-Name upsert whose Host does not uniquely match the
+// existing wildcard service is rejected as a new-service-needs-name
+// error rather than silently overwriting the wildcard. Before the
+// required-name contract this case relied on a Slugify cross-host
+// disambiguation; with the contract restored, the safer behavior is
+// to refuse the write so the caller picks an explicit name.
+func TestServicesUpsertEmptyNameDoesNotReplaceUnrelatedExisting(t *testing.T) {
+	ms, token := setupMockStoreWithSession(t)
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		ID: "bc-1", VaultID: "root-ns-id",
+		ServicesJSON: `[{"name":"github-com","host":"*.github.com","auth":{"type":"bearer","token":"WILDCARD_TOKEN"}}]`,
+	}
+	srv := newTestServer(withStore(ms))
+
+	body := `{"services":[{"host":"github.com","auth":{"type":"bearer","token":"BARE_TOKEN"}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/vaults/default/services", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (name required, no unique host match), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "name is required") {
+		t.Fatalf("expected error to mention 'name is required', got %s", rec.Body.String())
+	}
+	bc := ms.brokerConfigs["root-ns-id"]
+	if !strings.Contains(bc.ServicesJSON, "WILDCARD_TOKEN") {
+		t.Fatalf("expected wildcard service preserved (WILDCARD_TOKEN), got %s", bc.ServicesJSON)
+	}
+	if strings.Contains(bc.ServicesJSON, "BARE_TOKEN") {
+		t.Fatalf("expected new service NOT appended, got %s", bc.ServicesJSON)
+	}
+}
+
+// Regression: GET → modify-one → PUT on legacy unnamed services must
+// succeed without the caller manually slugging the siblings.
+func TestLegacyUnnamedServicesGetSetRoundTrip(t *testing.T) {
+	ms, token := setupMockStoreWithSession(t)
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		ID: "bc-1", VaultID: "root-ns-id",
+		ServicesJSON: `[
+			{"host":"api.anthropic.com","auth":{"type":"bearer","token":"ANTHROPIC_API_KEY"}},
+			{"host":"api.openai.com","auth":{"type":"bearer","token":"OPENAI_API_KEY"}}
+		]`,
+	}
+	srv := newTestServer(withStore(ms))
+
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/vaults/default/services", nil)
+	getReq.Header.Set("Authorization", "Bearer "+token)
+	getRec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET expected 200, got %d: %s", getRec.Code, getRec.Body.String())
+	}
+	var getResp struct {
+		Services []map[string]interface{} `json:"services"`
+	}
+	if err := json.NewDecoder(getRec.Body).Decode(&getResp); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	if len(getResp.Services) != 2 {
+		t.Fatalf("expected 2 services, got %d", len(getResp.Services))
+	}
+	if getResp.Services[0]["name"] != "api-anthropic-com" {
+		t.Fatalf("expected service[0].name=api-anthropic-com, got %v", getResp.Services[0]["name"])
+	}
+	if getResp.Services[1]["name"] != "api-openai-com" {
+		t.Fatalf("expected service[1].name=api-openai-com, got %v", getResp.Services[1]["name"])
+	}
+
+	// PUT with one renamed entry — mirrors the Edit Service sidebar.
+	getResp.Services[0]["name"] = "anthropic-api"
+	putBody, err := json.Marshal(map[string]interface{}{"services": getResp.Services})
+	if err != nil {
+		t.Fatalf("marshal PUT body: %v", err)
+	}
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/vaults/default/services", bytes.NewReader(putBody))
+	putReq.Header.Set("Authorization", "Bearer "+token)
+	putRec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT expected 200, got %d: %s", putRec.Code, putRec.Body.String())
+	}
+
+	bc := ms.brokerConfigs["root-ns-id"]
+	if !strings.Contains(bc.ServicesJSON, `"name":"anthropic-api"`) {
+		t.Fatalf("expected stored services to contain anthropic-api, got %s", bc.ServicesJSON)
+	}
+	if !strings.Contains(bc.ServicesJSON, `"name":"api-openai-com"`) {
+		t.Fatalf("expected stored services to contain auto-slugged api-openai-com, got %s", bc.ServicesJSON)
 	}
 }
 
@@ -5977,10 +6153,11 @@ func TestServicesUpsertExplicitNameMatchingExistingReplaces(t *testing.T) {
 	}
 }
 
-// TestProposalCreateRejectsActionSetMissingName pins that an ActionSet
-// proposal with no Name returns 400 — name is now required at the API
-// surface and is not auto-derived from host.
-func TestProposalCreateRejectsActionSetMissingName(t *testing.T) {
+// TestProposalCreateActionSetRejectsMissingNameForNewService pins the
+// "name is required for new services" contract on the proposal path:
+// an empty-Name ActionSet whose Host does not uniquely match an
+// existing service falls through to proposal.Validate which rejects.
+func TestProposalCreateActionSetRejectsMissingNameForNewService(t *testing.T) {
 	srv, _, token := setupProposalTest(t)
 
 	body := `{
@@ -5994,10 +6171,142 @@ func TestProposalCreateRejectsActionSetMissingName(t *testing.T) {
 	srv.httpServer.Handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for proposal missing service name, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 400 (name required for new service), got %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "name is required") {
-		t.Fatalf("expected 'name is required' error, got %s", rec.Body.String())
+		t.Fatalf("expected error to mention 'name is required', got %s", rec.Body.String())
+	}
+}
+
+// TestProposalCreateActionSetEmptyNameAdoptsExistingByHostPath pins
+// the proposal-flow same-host rename heal: an empty-Name ActionSet
+// targeting a host already owned by a renamed service (`stripe-prod`)
+// adopts the existing Name on the proposal record. Without this, the
+// proposal would persist `name:"api-stripe-com"`, MergeServices would
+// fail the Name-lookup, and apply would append an unreachable ghost.
+func TestProposalCreateActionSetEmptyNameAdoptsExistingByHostPath(t *testing.T) {
+	srv, ms, token := setupProposalTest(t)
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		ID: "bc-1", VaultID: "root-ns-id",
+		ServicesJSON: `[{"name":"stripe-prod","host":"api.stripe.com","auth":{"type":"bearer","token":"OLD_KEY"}}]`,
+	}
+
+	body := `{
+		"services": [{"action":"set","host":"api.stripe.com","auth":{"type":"bearer","token":"NEW_KEY"}}],
+		"credentials": [{"action":"set","key":"NEW_KEY"}],
+		"message": "rotate"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/proposals", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	props := ms.proposals["root-ns-id"]
+	if len(props) != 1 {
+		t.Fatalf("expected 1 proposal, got %d", len(props))
+	}
+	if !strings.Contains(props[0].ServicesJSON, `"name":"stripe-prod"`) {
+		t.Fatalf("expected proposal services_json to adopt stripe-prod, got %s", props[0].ServicesJSON)
+	}
+	if strings.Contains(props[0].ServicesJSON, "api-stripe-com") {
+		t.Fatalf("expected no auto-slug fallback, got %s", props[0].ServicesJSON)
+	}
+}
+
+// TestAdminProposalApplyRebindsStaleNameByHost pins the create→
+// rename→apply rebind. A proposal whose Name was correct at create
+// (adopted from the legacy heal of host api.stripe.com → api-stripe-com)
+// becomes stale when the admin renames the existing service to
+// stripe-prod before approving. At apply, normalize must rebind by
+// (Host, Path) so MergeServices upserts stripe-prod with the new
+// auth — instead of appending an unreachable ghost.
+func TestAdminProposalApplyRebindsStaleNameByHost(t *testing.T) {
+	ms := newMockStore()
+
+	ms.users["owner@test.com"] = &store.User{
+		ID: "owner-user-id", Email: "owner@test.com", Role: "owner", IsActive: true,
+	}
+	ms.GrantVaultRole(context.Background(), "owner-user-id", "user", "root-ns-id", "admin")
+	adminSess := &store.Session{
+		ID: "admin-session", UserID: "owner-user-id",
+		ExpiresAt: tp(time.Now().Add(time.Hour)), CreatedAt: time.Now(),
+	}
+	ms.sessions[adminSess.ID] = adminSess
+	srv := newTestServer(withStore(ms), withEncKey(make([]byte, 32)))
+
+	// Existing service was renamed (e.g. via Edit Service sidebar) from
+	// the heal-derived `api-stripe-com` to a friendlier `stripe-prod`.
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		VaultID: "root-ns-id",
+		ServicesJSON: `[
+			{"name":"stripe-prod","host":"api.stripe.com","auth":{"type":"bearer","token":"OLD_KEY"}}
+		]`,
+	}
+	// Pending proposal carries the pre-rename Name (api-stripe-com)
+	// because it was adopted from the legacy heal at create time.
+	ms.proposals = make(map[string][]store.Proposal)
+	ms.proposals["root-ns-id"] = []store.Proposal{{
+		ID: 1, VaultID: "root-ns-id", Status: "pending",
+		ServicesJSON:    `[{"action":"set","name":"api-stripe-com","host":"api.stripe.com","auth":{"type":"bearer","token":"NEW_KEY"}}]`,
+		CredentialsJSON: `[{"action":"set","key":"NEW_KEY","description":"Stripe key"}]`,
+		Message:         "Rotate Stripe key",
+		CreatedAt:       time.Now(),
+	}}
+
+	body := `{"vault":"default","credentials":{"NEW_KEY":"credential_value"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/proposals/1/approve", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+adminSess.ID)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (rebind by host succeeds), got %d: %s", rec.Code, rec.Body.String())
+	}
+	merged := ms.brokerConfigs["root-ns-id"].ServicesJSON
+	if !strings.Contains(merged, `"name":"stripe-prod"`) {
+		t.Fatalf("expected merged config to keep stripe-prod, got %s", merged)
+	}
+	if !strings.Contains(merged, `"token":"NEW_KEY"`) {
+		t.Fatalf("expected stripe-prod rotated to NEW_KEY, got %s", merged)
+	}
+	if strings.Contains(merged, `"token":"OLD_KEY"`) {
+		t.Fatalf("expected OLD_KEY replaced, got %s", merged)
+	}
+	if strings.Contains(merged, `"name":"api-stripe-com"`) {
+		t.Fatalf("expected no api-stripe-com ghost entry, got %s", merged)
+	}
+}
+
+// TestProposalCreateActionSetEmptyNameUnrelatedHostRejects pins that
+// an empty-Name ActionSet whose Host does not uniquely match an
+// existing service (e.g. the wildcard owns `*.github.com`, incoming
+// is bare `github.com`) is rejected as "name is required" instead of
+// silently overwriting the wildcard via cross-host slug collision.
+func TestProposalCreateActionSetEmptyNameUnrelatedHostRejects(t *testing.T) {
+	srv, ms, token := setupProposalTest(t)
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		ID: "bc-1", VaultID: "root-ns-id",
+		ServicesJSON: `[{"name":"github-com","host":"*.github.com","auth":{"type":"bearer","token":"WILDCARD_TOKEN"}}]`,
+	}
+
+	body := `{
+		"services": [{"action":"set","host":"github.com","auth":{"type":"bearer","token":"BARE_TOKEN"}}],
+		"credentials": [{"action":"set","key":"BARE_TOKEN"}],
+		"message": "add bare github"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/proposals", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (name required, no unique host match), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "name is required") {
+		t.Fatalf("expected error to mention 'name is required', got %s", rec.Body.String())
 	}
 }
 
