@@ -23,16 +23,19 @@ Agents should not possess credentials. Agent Vault eliminates credential exfiltr
 
 ## Why Agent Vault
 
-Traditional secrets management relies on returning credentials back to you applications and services. This breaks down with AI agents, which are non-deterministic systems that can be tricked via [prompt injection](https://en.wikipedia.org/wiki/Prompt_injection) into leaking secrets; this makes them a highly vulnerable surface. This is the problem of **credential exfiltration**.
+Traditional secrets management involves returning credentials back to you applications and services. This breaks down with AI agents which can be tricked via [prompt injection](https://en.wikipedia.org/wiki/Prompt_injection) into leaking secrets. This is the problem of **credential exfiltration**.
 
-Agent Vault is a credential broker and was created to solve credential exfiltration for AI agents (Claude Code, Hermes, OpenClaw, custom-built agents, etc.). Instead of giving AI agents credentals directly, you store them in Agent Vault (e.g. `ANTHROPIC_API_KEY`, `GITHUB_PAT`, etc.) and force your agents to route HTTP requests through it; Agent Vault intercepts every request and attaches credentials onto it before forwarding the request to the target outbound API.
+Agent Vault was created to solve credential exfiltration for all AI agents. Instead of giving AI agents credentals directly, you store them in Agent Vault (e.g. `ANTHROPIC_API_KEY`, `GITHUB_PAT`, etc.) and force your agents to route HTTP requests through it. Agent Vault intercepts every request and attaches credentials onto it before forwarding the request to the target outbound API.
 
 Features:
 
-- **Brokered access, not retrieval** - Your agent gets a scoped session and a local `HTTPS_PROXY`. It calls target APIs normally, and Agent Vault injects the right credential at the network layer (headers, or — for APIs like Twilio that need the value in the URL — declared placeholder rewrites in the path or query string). Service rules can scope by host and optional URL path, so the same host can carry multiple credentials at different paths (e.g. Slack with separate Bot and Connection rules). Credentials are never returned to the agent. Requests not matching any service forward as plain proxy traffic by default; flip a vault into strict deny mode (`unmatched_host_policy=deny`) to reject them with 403 instead.
-- **Works with any agent** - Custom Python/TypeScript agents, sandboxed processes, and coding agents like Claude Code, Cursor, and Codex. Anything that speaks HTTP — including streaming responses and WebSocket-based voice/realtime APIs (e.g. OpenAI Realtime).
-- **Encrypted at rest** - Credentials are encrypted with AES-256-GCM using a random data encryption key (DEK). An optional master password wraps the DEK via Argon2id, so rotating the password does not re-encrypt credentials. A passwordless mode is available for PaaS deploys.
-- **Request logs** - Every proxied request is persisted per vault with method, host, path, status, latency, and the credential key names involved. Bodies, headers, and query strings are not recorded. Retention is configurable per vault.
+- **Credential Brokering**: Broker AI agents access target services like LLM providers and GitHub without them holding any real credentials. Agent Vault is able to broker that access by substituting dummy values in headers like `__anthropic_api_key__` with real credentials or replacing auth headers entirely on outbound requests through it.
+- **Transparent Integration**: Let AI agents use existing tools like MCP, CLI, SDK, API with all underlying requests automatically routed through Agent Vault. Agent Vault takes an interface-agnostic, non-invasive approach to credential brokering by bootstrapping your agents' environment to use `HTTPS_PROXY` and be compatible with Agent Vault's MITM architecture.
+- **Purpose-Built Design**: Existing forward proxies like `mitmproxy` or `squid` require modification to perform credential brokering and integrate well with agents. Agent Vault is purpose-built to work with the ergonomics of all types of agent use-cases with a dedicated CLI, multi-tenancy, and agent-specific roadmap backed by [Infisical](https://github.com/Infisical/infisical).
+- **Egress Filtering**: Control which agents should have access to which services and API endpoints on them since authenticated requests flow through Agent Vault.
+- **Request Logging**: Inspect authenticated traffic to monitor and diagnose agent behavior.
+
+By default, requests not matching any service forward as plain proxy traffic; flip a vault into strict deny mode (`unmatched_host_policy=deny`) to reject them with 403 instead.
 
 Read the full backstory behind Agent Vault [here](https://infisical.com/blog/agent-vault-the-open-source-credential-proxy-and-vault-for-agents).
 
@@ -51,20 +54,13 @@ Agent Vault is both a vault and proxy service and ships as a single binary that 
 
 You can configure Agent Vault to broker credentials for an AI agents in just a few steps:
 
-1. [Install](https://docs.agent-vault.dev/installation) and start an Agent Vault server.
-
-You can run this script to install Agent Vault, supporting macOS (Intel + Apple Silicon) and Linux (x86_64 + ARM64):
+1. [Install](https://docs.agent-vault.dev/installation) and start an Agent Vault server. You can run the script below to Install Agent Vault, supporting macOS (Intel + Apple Silicon) and Linux (x86_64 + ARM64):
 
 ```bash
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://get.agent-vault.dev | sh
 ```
 
-.
-
-Start the Agent Vault server and set a master password for it; the password is used as part of its [data encryption mechanism](https://docs.agent-vault.dev/learn/security) and is unset
-from the process after the initial read.
-
-You should store this password somewhere safe.
+Start the Agent Vault server and set a master password for it (store it somewhere safe); the password is used as part of its [data encryption mechanism](https://docs.agent-vault.dev/learn/security) and is unset from the process after the initial read.
 
 ```bash
 export AGENT_VAULT_MASTER_PASSWORD=your-password
@@ -79,39 +75,13 @@ docker run -it -p 14321:14321 -p 14322:14322 \
   -v agent-vault-data:/data infisical/agent-vault
 ```
 
-The server starts the HTTP API on port `14321` and a TLS-encrypted transparent HTTP/HTTPS proxy on port `14322` — the same listener handles `CONNECT` for `https://` upstreams and absolute-form forward-proxy requests for `http://` upstreams. A web UI is available at `http://<host>:14321` and you'll be prompted to create the first user known as the instance **owner**.
+The server starts the HTTP API on port `14321` and a TLS-encrypted transparent HTTP/HTTPS proxy on port `14322`; the same listener handles `CONNECT` for `https://` upstreams and absolute-form forward-proxy requests for `http://` upstreams.
 
-2. Create a [vault](https://docs.agent-vault.dev/learn/vaults), input your [credentials](https://docs.agent-vault.dev/learn/credentials), and configure [service rules](https://docs.agent-vault.dev/learn/services) in Agent Vault either through the management UI or via CLI on the Agent Vault machine. For example:
+The web UI becomes available at `http://<host>:14321` and you'll be prompted to create the first user known as the instance **owner**.
 
-You can create a credential for `ANTHROPIC_API_KEY` and create a service rule for Agent Vault to substitute a dummy value `__anthropic_api_key__` for the real key. Conceptually:
+2. Create a [vault](https://docs.agent-vault.dev/learn/vaults), input your [credentials](https://docs.agent-vault.dev/learn/credentials), and configure [service rules](https://docs.agent-vault.dev/learn/services) in Agent Vault either through the management UI or via CLI on the Agent Vault machine. For example, you can create a credential for `ANTHROPIC_API_KEY` and create a service rule for Agent Vault to substitute a dummy value `__anthropic_api_key__` for the real key.
 
-If you were to do this via CLI on the Agent Vault machine:
-
-```bash
-agent-vault vault create my-vault
-```
-
-```bash
-agent-vault vault credential set ANTHROPIC_API_KEY=<your-anthropic-api-key> --vault my-vault
-```
-
-```
-services:
-- name: anthropic-api
-  host: api.anthropic.com
-  auth:
-  type: passthrough
-  substitutions:
-  - key: ANTHROPIC_API_KEY
-    placeholder: **anthropic_api_key**
-    in: [header]
-```
-
-```bash
-agent-vault vault service set -f <filename>.yaml --vault my-vault
-```
-
-3. Create an [agent](https://docs.agent-vault.dev/agents/overview) to represent a long-running agent and obtain a token for it. Alternatively, if you're spinning up ephemeral sandboxed agents, you can use [agent](https://docs.agent-vault.dev/agents/overview) to represent an orchestrator backend and use it to mint a short-lived token to be passed into the sandbox for the agent to use and proxy requests through Agent Vault.
+3. Create an [agent](https://docs.agent-vault.dev/agents/overview) to represent a long-running agent and obtain a **token** for it. Alternatively, if you're spinning up ephemeral sandboxed agents, you can use [agent](https://docs.agent-vault.dev/agents/overview) to represent an orchestrator backend and use it to mint a short-lived **token** to be passed into the sandbox for the agent to use and proxy requests through Agent Vault.
 
 4. Set the following environment variables in your AI agent's environment:
 
@@ -123,24 +93,11 @@ AGENT_VAULT_VAULT=<vault-in-agent-vault>
 ANTHROPIC_API_KEY=__anthropic_api_key__ // dummy key that will be substituted by Agent Vault
 ```
 
-5. [Install](https://docs.agent-vault.dev/installation) the Agent Vault CLI into your agent's environment; this could be done in a Dockerfile as well.
-
-You can run this script to install Agent Vault CLI (same one used for the Agent Vault server):
+5. [Install](https://docs.agent-vault.dev/installation) the Agent Vault CLI into your agent's environment and run the Agent Vault CLI with your agent to start proxying requests through Agent Vault.
 
 ```bash
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://get.agent-vault.dev | sh
 ```
-
-Or install it via a Dockerfile by copying the binary into your own image:
-
-```dockerfile
-# Add this line to your existing Dockerfile alongside your agent or app setup.
-COPY --from=infisical/agent-vault:latest /usr/local/bin/agent-vault /usr/local/bin/agent-vault
-```
-
-5. Run the Agent Vault CLI with your agent; this bootstraps the agent's environment to start proxying requests through Agent Vault.
-
-With `AGENT_VAULT_ADDR`, `AGENT_VAULT_TOKEN`, and `AGENT_VAULT_VAULT` set on the agent's environment per step 4, `agent-vault run` authenticates against the broker and execs your agent with `HTTPS_PROXY` / `HTTP_PROXY` and the CA-trust env vars pre-configured:
 
 ```bash
 agent-vault run -- claude
@@ -149,13 +106,16 @@ agent-vault vault run -- codex
 agent-vault vault run -- opencode
 ```
 
-Or wrap your agent process in your Dockerfile (with the same three env vars set on the container's environment):
+Alternatively, if your agent is running with Docker, you can install the Agent Vault CLI via a Dockerfile by copying the binary into your own image and using it to start up your agent process:
 
 ```dockerfile
+# Add this line to your existing Dockerfile alongside your agent or app setup.
+COPY --from=infisical/agent-vault:latest /usr/local/bin/agent-vault /usr/local/bin/agent-vault
+
+...
+
 ENTRYPOINT ["agent-vault", "run", "--", "claude"]
 ```
-
-See [Deploy your agent in a container](https://docs.agent-vault.dev/guides/deploy-agent-container) for the full container setup.
 
 There are many ways to deploying Agent Vault and integrating your AI agents with it. We recommend consulting the fuller [documentation](https://docs.agent-vault.dev/installation).
 
@@ -170,9 +130,9 @@ There are many ways to deploying Agent Vault and integrating your AI agents with
 
 3. Tokens: You should create an [agent](https://docs.agent-vault.dev/agents/overview) in Agent Vault to represent a long-lived agent. For ephemeral sandboxes, you may prefer to mint short-lived, vault-scoped tokens for sandboxed agents to use to proxy requests through Agent Vault.
 
-### SDK — sandboxed agents (Docker, Daytona, E2B)
+## SDK
 
-For agents running inside containers, use the SDK from your orchestrator to mint a session and pass proxy config into the sandbox:
+Agent Vault offers a TypeScript SDK in the event you'd like an orchestrator to mint a short-lived token and pass proxy config into a sandboxed agent to have it proxy requests through Agent Vault that way.
 
 ```bash
 npm install @infisical/agent-vault-sdk
@@ -182,11 +142,11 @@ npm install @infisical/agent-vault-sdk
 import { AgentVault, buildProxyEnv } from "@infisical/agent-vault-sdk";
 
 const av = new AgentVault({
-  token: "YOUR_TOKEN",
+  token: "YOUR_TOKEN", // agent token
   address: "http://localhost:14321",
 });
 const session = await av
-  .vault("default")
+  .vault("my-vault")
   .sessions.create({ vaultRole: "proxy" });
 
 // certPath is where you'll mount the CA certificate inside the sandbox.
