@@ -147,6 +147,13 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// External-store vaults reject credential mutations; service-only proposals still work.
+	if len(req.Credentials) > 0 {
+		if !s.assertBuiltinCredentialStore(w, ctx, vaultID, resolvedVault.Name) {
+			return
+		}
+	}
+
 	// Resolve unnamed-delete targets against existing vault state.
 	existing, err := s.loadServices(ctx, vaultID)
 	if err != nil {
@@ -414,6 +421,13 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 	if err := json.Unmarshal([]byte(cs.CredentialsJSON), &credentialSlots); err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to parse proposal credentials")
 		return
+	}
+
+	// Defense-in-depth: re-check at apply time in case the vault flipped to external.
+	if len(credentialSlots) > 0 {
+		if !s.assertBuiltinCredentialStore(w, ctx, ns.ID, ns.Name) {
+			return
+		}
 	}
 
 	// Load agent-provided encrypted credentials.

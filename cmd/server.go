@@ -20,6 +20,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/auth"
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/crypto"
+	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/notify"
 	"github.com/Infisical/agent-vault/internal/pidfile"
@@ -156,7 +157,7 @@ var serverCmd = &cobra.Command{
 		srv.SetSkills(skillCLI, skillHTTP)
 		shutdownLogs := attachLogSink(srv, db, logger)
 		defer shutdownLogs()
-		if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey.Key()); err != nil {
+		if err := attachServerExtensions(srv, host, mitmPort, masterKey.Key(), logger); err != nil {
 			return err
 		}
 		return srv.Start()
@@ -199,6 +200,46 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		},
 	))
 	return nil
+}
+
+// attachServerExtensions wires optional subsystems (MITM, Infisical) onto srv.
+// Both bootstrap paths (foreground and detached child) call this.
+func attachServerExtensions(srv *server.Server, host string, mitmPort int, masterKey []byte, logger *slog.Logger) error {
+	if err := attachMITMIfEnabled(srv, host, mitmPort, masterKey); err != nil {
+		return err
+	}
+	attachInfisicalIfConfigured(srv, logger)
+	return nil
+}
+
+// attachInfisicalIfConfigured wires the Infisical client when INFISICAL_URL
+// is set. The 10s deadline uses time.After because the SDK login is
+// synchronous and ignores ctx; on timeout we proceed without a client so
+// external vaults serve-stale until next restart.
+func attachInfisicalIfConfigured(srv *server.Server, logger *slog.Logger) {
+	if os.Getenv("INFISICAL_URL") == "" {
+		return
+	}
+	type result struct {
+		c   *infisical.Client
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := infisical.NewClient(context.Background(), logger)
+		done <- result{c, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			logger.Warn("infisical client unavailable; external-store vaults will not refresh",
+				slog.String("err", r.err.Error()))
+			return
+		}
+		srv.AttachInfisical(r.c)
+	case <-time.After(10 * time.Second):
+		logger.Warn("infisical client login exceeded 10s deadline; continuing without external store")
+	}
 }
 
 // attachLogSink wires the request-log pipeline: a SQLiteSink with async
@@ -478,7 +519,7 @@ func runDetachedChild(host, addr string, mitmPort int, logger *slog.Logger) erro
 	srv.SetSkills(skillCLI, skillHTTP)
 	shutdownLogs := attachLogSink(srv, db, logger)
 	defer shutdownLogs()
-	if err := attachMITMIfEnabled(srv, host, mitmPort, key); err != nil {
+	if err := attachServerExtensions(srv, host, mitmPort, key, logger); err != nil {
 		return err
 	}
 	return srv.Start()

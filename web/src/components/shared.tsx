@@ -45,6 +45,31 @@ export function ErrorBanner({
   );
 }
 
+export function InfoBanner({
+  children,
+  action,
+  className = "",
+}: {
+  children: React.ReactNode;
+  action?: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`rounded-lg border border-border bg-surface-raised p-4 text-sm text-text-muted ${className}`}
+    >
+      {action ? (
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0 flex-1">{children}</div>
+          <div className="flex-shrink-0">{action}</div>
+        </div>
+      ) : (
+        children
+      )}
+    </div>
+  );
+}
+
 export function EmptyState({ message }: { message: string }) {
   return (
     <div className="text-center py-20 text-text-muted text-sm">{message}</div>

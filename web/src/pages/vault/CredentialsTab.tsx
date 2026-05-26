@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from "react";
+import { useRouter } from "@tanstack/react-router";
 import { useVaultParams, LoadingSpinner, ErrorBanner } from "./shared";
+import { InfoBanner } from "../../components/shared";
 import DropdownMenu from "../../components/DropdownMenu";
 import DataTable, { type Column } from "../../components/DataTable";
 import Modal from "../../components/Modal";
@@ -9,10 +11,16 @@ import FormField from "../../components/FormField";
 import { apiFetch } from "../../lib/api";
 
 export default function CredentialsTab() {
-  const { vaultName, vaultRole } = useVaultParams();
+  const router = useRouter();
+  const { vaultName, vaultRole, credentialStore } = useVaultParams();
+  const externalKind = credentialStore?.kind;
+  const isExternal = !!externalKind;
+  const pollSecs = credentialStore?.poll_interval_seconds;
   const [keys, setKeys] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState("");
 
   // Add/Edit modal state
   const [modalOpen, setModalOpen] = useState(false);
@@ -44,6 +52,32 @@ export default function CredentialsTab() {
       setError("Network error.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleSyncNow() {
+    setSyncing(true);
+    setSyncError("");
+    try {
+      const resp = await apiFetch(
+        `/v1/vaults/${encodeURIComponent(vaultName)}/sync`,
+        { method: "POST" }
+      );
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        setSyncError(data.error || "Sync failed.");
+        return;
+      }
+      // Invalidate the vault subtree so SettingsTab picks up the updated
+      // sync health without refetching the parent route's loaders.
+      await Promise.all([
+        fetchKeys(),
+        router.invalidate({ filter: (m) => m.routeId.startsWith("/vaults/") }),
+      ]);
+    } catch {
+      setSyncError("Network error.");
+    } finally {
+      setSyncing(false);
     }
   }
 
@@ -87,7 +121,7 @@ export default function CredentialsTab() {
     }
   }
 
-  const isAdmin = vaultRole === "admin";
+  const isAdmin = vaultRole === "admin" && !isExternal;
   const canReveal = vaultRole === "member" || vaultRole === "admin";
 
   // Reveal state: tracks which credential values have been fetched and are visible.
@@ -242,6 +276,31 @@ export default function CredentialsTab() {
         )}
       </div>
 
+      {isExternal && (
+        <>
+          <InfoBanner
+            className={syncError ? "mb-2" : "mb-4"}
+            action={
+              canReveal ? (
+                <Button
+                  variant="secondary"
+                  onClick={handleSyncNow}
+                  loading={syncing}
+                  disabled={syncing}
+                >
+                  Manual sync
+                </Button>
+              ) : undefined
+            }
+          >
+            Credentials for this vault are synced read-only from{" "}
+            <span className="font-medium text-text">{externalKind}</span>
+            {pollSecs ? ` every ${pollSecs}s` : ""}.
+          </InfoBanner>
+          {syncError && <ErrorBanner message={syncError} className="mb-4" />}
+        </>
+      )}
+
       {loading ? (
         <LoadingSpinner />
       ) : error ? (
@@ -251,8 +310,12 @@ export default function CredentialsTab() {
           columns={columns}
           data={keys}
           rowKey={(key) => key}
-          emptyTitle="No credentials stored"
-          emptyDescription="Credentials will appear here when agents request and you approve them."
+          emptyTitle={isExternal ? "No credentials synced yet" : "No credentials stored"}
+          emptyDescription={
+            isExternal
+              ? "Add credentials in the upstream system; they'll appear here after the next sync."
+              : "Credentials will appear here when agents request and you approve them."
+          }
         />
       )}
 

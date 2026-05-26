@@ -188,6 +188,18 @@ How it works:
 
 Substitutions are configured via JSON only — no flag form. Place a `substitutions` array under any `services[]` entry in `proposal create -f file.json` or `agent-vault service set -f services.yaml`.
 
+### Vaults backed by an external credential store
+
+Run `agent-vault vault credential-store show <name>` to check the kind. `builtin` is writable; anything else is read-only on the Agent Vault side (manage credentials upstream).
+
+For read-only vaults:
+- `vault credential set/delete` return `409 external_credential_store`.
+- `vault proposal create` rejects `--credential` / `credentials[]` blocks. Service-only proposals work and may reference existing upstream keys.
+
+Creating an external-store vault (`vault create --credential-store=infisical ...`) is owner-only: the broker's machine identity, not the caller's, authorizes the upstream fetch. Upstream secret names must match `^[A-Z][A-Z0-9_]*$` or create/sync fails with `external_store_invalid_key` naming the offending key.
+
+Refresh on demand with `agent-vault vault credential-store sync <name>` (or `POST {AGENT_VAULT_ADDR}/v1/vaults/{name}/sync`; any vault member). Returns the post-refresh `credential_store` summary; conflicts with an in-flight refresh return `409`. The periodic syncer keeps the vault fresh otherwise, so manual sync is for "I just rotated a secret upstream" cases.
+
 ### Creating a Proposal
 
 **Flag-driven mode (common cases). When `--host` is provided, `--name` is optional — when omitted, the server slugifies `host`+`path` (e.g. `api.stripe.com` → `api-stripe-com`):**
@@ -332,6 +344,7 @@ Prints the raw value to stdout (pipe-friendly). Useful for configuration tasks w
 - 403 `service_disabled`: Host is configured but currently disabled by an operator. Don't create a new proposal; surface the error to the user so they can re-enable it (UI toggle, or `agent-vault vault service enable <name-or-host>`). If multiple services share the host, use the canonical service name from `/discover`; passing the bare host returns 409 with a candidate list.
 - 409 `multiple services match host …`: A `vault service remove`, `enable`, or `disable` was passed a bare host that's used by more than one path-scoped service. The error body includes a `candidates` array of `{name, host}` where each `host` carries the joined inline form (e.g. `slack.com/api/*`). Retry with the specific service name shown in `/discover`.
 - 403 `Instance member role required`: Your instance role is `no-access` and you tried an instance-scoped action (create vault, create agents, list users/agents). You can still operate within vaults you've been granted -- proxy traffic, raise proposals, and read credentials at vault scope. If you genuinely need an instance-scoped action, surface this to the user; an instance owner must change your role.
+- 409 `external_credential_store`: `vault credential set/delete` was attempted on an external-store vault (e.g. Infisical-backed). Credentials there are read-only from Agent Vault's side; manage them in the upstream system. Don't retry.
 - 429: Rate limited. The response carries a `Retry-After` header (seconds) and a JSON body `{"error":"too_many_requests", ...}`. Respect `Retry-After` — wait that many seconds before retrying. Don't tight-loop. If this trips on normal work, ask the instance owner to raise the limit in **Manage Instance → Settings → Rate Limiting**.
 - 502: Missing credential or upstream unreachable, tell user a credential may need to be added
 

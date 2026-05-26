@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { useVaultParams, ErrorBanner } from "./shared";
+import { useVaultParams, ErrorBanner, timeAgo } from "./shared";
+import type { CredentialStoreInfo } from "../../router";
 import Button from "../../components/Button";
 import Input from "../../components/Input";
 import FormField from "../../components/FormField";
@@ -11,7 +12,7 @@ import { apiFetch } from "../../lib/api";
 type UnmatchedHostPolicy = "passthrough" | "deny";
 
 export default function SettingsTab() {
-  const { vaultName, vaultRole, isOwner } = useVaultParams();
+  const { vaultName, vaultRole, isOwner, credentialStore } = useVaultParams();
   const navigate = useNavigate();
   const canManage = vaultRole === "admin" || isOwner;
   const isDefault = vaultName === "default";
@@ -144,42 +145,48 @@ export default function SettingsTab() {
         </p>
       </div>
 
-      {/* Vault config (rename + unmatched-host policy) */}
+      {/* Vault config (rename + unmatched-host policy + credential store) */}
       <section className="mb-8">
-        <div className="border border-border rounded-xl bg-surface p-5">
-          <div className="max-w-md">
-            <form onSubmit={handleRename} className="flex items-end gap-3">
-              <div className="flex-1 min-w-0">
-                <FormField label="Vault Name">
-                  <Input
-                    value={newName}
-                    onChange={(e) => {
-                      setNewName(e.target.value);
-                      setRenameError("");
-                      setRenameSuccess("");
-                    }}
-                    disabled={!canManage || isDefault}
-                    placeholder="vault-name"
-                  />
-                </FormField>
-              </div>
-              <Button
-                type="submit"
-                disabled={!canManage || isDefault || !newName || newName === vaultName}
-                loading={renaming}
-              >
-                Rename
-              </Button>
-            </form>
+        <div className="border border-border rounded-xl bg-surface">
+          <div className="p-5">
+            <div className="max-w-md">
+              <form onSubmit={handleRename} className="flex items-end gap-3">
+                <div className="flex-1 min-w-0">
+                  <FormField label="Vault Name">
+                    <Input
+                      value={newName}
+                      onChange={(e) => {
+                        setNewName(e.target.value);
+                        setRenameError("");
+                        setRenameSuccess("");
+                      }}
+                      disabled={!canManage || isDefault}
+                      placeholder="vault-name"
+                    />
+                  </FormField>
+                </div>
+                <Button
+                  type="submit"
+                  disabled={!canManage || isDefault || !newName || newName === vaultName}
+                  loading={renaming}
+                >
+                  Rename
+                </Button>
+              </form>
 
-            {renameError && <ErrorBanner message={renameError} className="mt-3" />}
-            {renameSuccess && (
-              <div className="mt-3 bg-success-bg border border-success/20 rounded-lg p-4 text-sm text-success">
-                {renameSuccess}
-              </div>
-            )}
+              {renameError && <ErrorBanner message={renameError} className="mt-3" />}
+              {renameSuccess && (
+                <div className="mt-3 bg-success-bg border border-success/20 rounded-lg p-4 text-sm text-success">
+                  {renameSuccess}
+                </div>
+              )}
+            </div>
+          </div>
 
-            <div className="mt-5 pt-5 border-t border-border">
+          <div className="border-t border-border mx-5" />
+
+          <div className="p-5">
+            <div className="max-w-md">
               <label className="block text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">
                 Strict deny mode
               </label>
@@ -194,11 +201,13 @@ export default function SettingsTab() {
                   ariaLabel="Strict deny mode"
                 />
               </div>
+              {policyError && (
+                <ErrorBanner message={policyError} className="mt-3" />
+              )}
             </div>
-            {policyError && (
-              <ErrorBanner message={policyError} className="mt-3" />
-            )}
           </div>
+
+          <CredentialStoreSection store={credentialStore} />
         </div>
       </section>
 
@@ -236,3 +245,57 @@ export default function SettingsTab() {
     </div>
   );
 }
+
+function CredentialStoreSection({ store }: { store?: CredentialStoreInfo }) {
+  const config = (store?.config ?? {}) as {
+    project_id?: string;
+    environment?: string;
+    secret_path?: string;
+  };
+  const isInfisical = store?.kind === "infisical";
+  const kindLabel = !store ? "Built-in" : isInfisical ? "Infisical" : store.kind;
+
+  return (
+    <>
+      <div className="border-t border-border mx-5" />
+      <div className="p-5 grid grid-cols-2 gap-x-6 gap-y-4">
+        <div className="col-span-2">
+          <StoreField label="Credential store" value={kindLabel} />
+        </div>
+        {/* Config is redacted server-side for non-admin viewers; sync status
+            stays populated for everyone. */}
+        {isInfisical && store?.config && (
+          <>
+            <StoreField label="Project" value={config.project_id ?? "—"} />
+            <StoreField label="Environment" value={config.environment ?? "—"} />
+            <StoreField label="Secret path" value={config.secret_path || "/"} />
+          </>
+        )}
+        {isInfisical && store?.last_synced_at && (
+          <StoreField
+            label={store.last_sync_status === "error" ? "Last attempt" : "Last sync"}
+            value={timeAgo(store.last_synced_at)}
+          />
+        )}
+      </div>
+
+      {store?.last_sync_error && (
+        <div className="px-5 pb-4">
+          <ErrorBanner message={store.last_sync_error} />
+        </div>
+      )}
+    </>
+  );
+}
+
+function StoreField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs font-semibold uppercase tracking-wider text-text-muted mb-2">
+        {label}
+      </div>
+      <div className="text-sm font-mono text-text break-all">{value}</div>
+    </div>
+  );
+}
+

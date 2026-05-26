@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/crypto"
+	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/notify"
@@ -80,6 +82,11 @@ type Server struct {
 	// concurrent upserts can both pass collision checks against the
 	// same pre-state.
 	vaultServiceMu sync.Map // vaultID (string) -> *sync.Mutex
+	// infisicalClient is nil when INFISICAL_URL is unset; create handlers
+	// reject kind="infisical" then.
+	infisicalClient *infisical.Client
+	// infisicalSyncer is built in Run; exposed for manual-refresh RefreshOnce.
+	infisicalSyncer *infisical.Syncer
 }
 
 // lockVaultServices acquires the per-vault mutation lock. Callers MUST
@@ -99,6 +106,14 @@ func (s *Server) RateLimit() *ratelimit.Registry { return s.rateLimit }
 // is bound to this Server: Start launches it, and SIGINT/SIGTERM/Shutdown
 // stops it alongside the HTTP server.
 func (s *Server) AttachMITM(p *mitm.Proxy) { s.mitm = p }
+
+// AttachInfisical registers the Infisical client. Must be called before Start.
+func (s *Server) AttachInfisical(c *infisical.Client) { s.infisicalClient = c }
+
+// AttachInfisicalSyncer pre-wires a syncer instead of letting Start build one
+// from the attached client. Used by tests to inject a fake fetcher; in prod
+// Start auto-builds one when the field is nil.
+func (s *Server) AttachInfisicalSyncer(syncer *infisical.Syncer) { s.infisicalSyncer = syncer }
 
 // AttachLogSink swaps the per-request log sink. Safe to call once at
 // startup, before the HTTP server begins accepting connections. nil
@@ -244,6 +259,13 @@ type Store interface {
 	GetVaultSetting(ctx context.Context, vaultID, key string) (string, error)
 	SetVaultSetting(ctx context.Context, vaultID, key, value string) error
 	DeleteVaultSetting(ctx context.Context, vaultID, key string) error
+
+	// External credential stores
+	CreateExternalVault(ctx context.Context, p store.CreateExternalVaultParams) (*store.Vault, error)
+	GetVaultCredentialStore(ctx context.Context, vaultID string) (*store.VaultCredentialStore, error)
+	ListVaultCredentialStores(ctx context.Context) ([]store.VaultCredentialStore, error)
+	UpdateVaultCredentialStoreHealth(ctx context.Context, vaultID, status, errMsg string, syncedAt time.Time) error
+	ReplaceVaultCredentials(ctx context.Context, vaultID string, items []store.EncryptedKV) error
 
 	// Agents
 	CreateAgent(ctx context.Context, name, createdBy, role string) (*store.Agent, error)
@@ -552,6 +574,22 @@ func (s *Server) requireVaultMember(w http.ResponseWriter, r *http.Request, vaul
 	return actor, nil
 }
 
+// assertBuiltinCredentialStore writes 409 and returns false when the vault
+// is external-backed. Fails closed (500) on transient lookup errors.
+func (s *Server) assertBuiltinCredentialStore(w http.ResponseWriter, ctx context.Context, vaultID, vaultName string) bool {
+	cs, err := s.store.GetVaultCredentialStore(ctx, vaultID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		jsonError(w, http.StatusInternalServerError, "Failed to verify credential store")
+		return false
+	}
+	if cs != nil && cs.Kind != "" {
+		jsonCodedError(w, http.StatusConflict, "external_credential_store",
+			fmt.Sprintf("Vault %q uses an external credential store (%s). Manage credentials in the upstream system.", vaultName, cs.Kind))
+		return false
+	}
+	return true
+}
+
 // requireProposalReview checks proposal approve/reject access.
 // Scoped sessions require admin role (proxy-scoped sessions cannot self-approve).
 // Instance-level sessions require member+ — proxy-role actors are forbidden so
@@ -705,6 +743,8 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 
 	// Vault management (any auth'd user)
 	mux.HandleFunc("GET /v1/vaults/{name}/context", s.requireInitialized(s.requireAuth(actorAuthed(s.handleVaultContext))))
+	mux.HandleFunc("POST /v1/vaults/{name}/sync", s.requireInitialized(s.requireAuth(actorAuthed(s.handleVaultSyncNow))))
+	mux.HandleFunc("GET /v1/instance/credential-stores", s.requireInitialized(s.requireAuth(actorAuthed(s.handleInstanceCredentialStores))))
 	mux.HandleFunc("POST /v1/vaults", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleVaultCreate)))))
 	mux.HandleFunc("GET /v1/vaults", s.requireInitialized(s.requireAuth(actorAuthed(s.handleVaultList))))
 	mux.HandleFunc("DELETE /v1/vaults/{name}", s.requireInitialized(s.requireAuth(actorAuthed(s.handleVaultDelete))))
@@ -818,9 +858,26 @@ func (s *Server) Start() error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	pruneCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	pruneCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
 	go s.runTouchCachePruner(pruneCtx)
+
+	// syncerDone closes once Syncer.Run has returned AND drained its in-flight
+	// refresh goroutines. We block on it before WipeBytes so a refresh mid-
+	// AES-GCM never reads a zeroed s.encKey (silently produces garbage
+	// ciphertext that lands in the credentials table).
+	syncerDone := make(chan struct{})
+	if s.infisicalSyncer == nil && s.infisicalClient != nil {
+		s.infisicalSyncer = infisical.NewSyncer(s.store, s.infisicalClient, s.encKey, s.logger)
+	}
+	if s.infisicalSyncer != nil {
+		go func() {
+			defer close(syncerDone)
+			s.infisicalSyncer.Run(pruneCtx)
+		}()
+	} else {
+		close(syncerDone)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -877,6 +934,17 @@ func (s *Server) Start() error {
 	if err := s.httpServer.Shutdown(ctx); err != nil {
 		return fmt.Errorf("server shutdown: %w", err)
 	}
+
+	// Stop background workers (syncer + touch-cache pruner) and wait for the
+	// syncer's in-flight refreshes to drain before zeroing s.encKey.
+	stopWorkers()
+	select {
+	case <-syncerDone:
+	case <-time.After(5 * time.Second):
+		fmt.Fprintln(os.Stderr, "warning: infisical syncer did not stop within 5s; skipping key wipe to avoid racing in-flight encrypts")
+		return nil
+	}
+
 	fmt.Println("server shut down gracefully")
 	crypto.WipeBytes(s.encKey)
 	return nil

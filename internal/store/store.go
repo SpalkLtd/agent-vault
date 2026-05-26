@@ -178,6 +178,51 @@ type EncryptedCredential struct {
 	Nonce      []byte
 }
 
+// EncryptedKV pairs a credential key with its AES-256-GCM ciphertext+nonce.
+type EncryptedKV struct {
+	Key        string
+	Ciphertext []byte
+	Nonce      []byte
+}
+
+// Wire-protocol values for VaultCredentialStore.Kind. KindBuiltin is the
+// API sentinel for "no external store" and is never persisted.
+const (
+	CredentialStoreBuiltin   = "builtin"
+	CredentialStoreInfisical = "infisical"
+)
+
+// Wire-protocol values for VaultCredentialStore.LastSyncStatus.
+const (
+	SyncStatusOK    = "ok"
+	SyncStatusError = "error"
+)
+
+// VaultCredentialStore is the per-vault external-source row; absence means built-in.
+type VaultCredentialStore struct {
+	VaultID             string
+	Kind                string // CredentialStoreInfisical
+	ConfigJSON          string // per-kind config blob
+	PollIntervalSeconds int
+	LastSyncedAt        *time.Time
+	LastSyncStatus      string // SyncStatus*
+	LastSyncError       string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// CreateExternalVaultParams carries inputs to CreateExternalVault. The
+// creator is persisted as an admin vault_grants row in the same transaction.
+type CreateExternalVaultParams struct {
+	Name                string
+	Kind                string
+	ConfigJSON          string
+	PollIntervalSeconds int
+	Credentials         []EncryptedKV
+	CreatorActorID      string
+	CreatorActorType    string // "user" or "agent"
+}
+
 // RequestLog is a persisted record of a single proxied request. Secret-free
 // by construction: no header values, no bodies, no query strings — only
 // metadata already safe to log (see internal/brokercore/logging.go).
@@ -417,6 +462,14 @@ type Store interface {
 	GetVaultSetting(ctx context.Context, vaultID, key string) (string, error)
 	SetVaultSetting(ctx context.Context, vaultID, key, value string) error
 	DeleteVaultSetting(ctx context.Context, vaultID, key string) error
+
+	// External credential stores (per vault)
+	CreateExternalVault(ctx context.Context, p CreateExternalVaultParams) (*Vault, error)
+	GetVaultCredentialStore(ctx context.Context, vaultID string) (*VaultCredentialStore, error)
+	ListVaultCredentialStores(ctx context.Context) ([]VaultCredentialStore, error)
+	UpdateVaultCredentialStoreHealth(ctx context.Context, vaultID, status, errMsg string, syncedAt time.Time) error
+	// ReplaceVaultCredentials atomically wipes and rewrites the vault's credentials.
+	ReplaceVaultCredentials(ctx context.Context, vaultID string, items []EncryptedKV) error
 
 	// Request logs
 	InsertRequestLogs(ctx context.Context, rows []RequestLog) error
