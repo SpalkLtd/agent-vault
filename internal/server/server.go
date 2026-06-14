@@ -21,10 +21,10 @@ import (
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/infisical"
-	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/netguard"
 	"github.com/Infisical/agent-vault/internal/notify"
+	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/pidfile"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
@@ -57,17 +57,17 @@ type agentVaultJSON struct {
 
 // Server is the Agent Vault HTTP server.
 type Server struct {
-	httpServer     *http.Server
-	store          Store
-	encKey         []byte // 32-byte encryption key, held in memory while running
-	notifier       *notify.Notifier
-	initialized    bool   // true when at least one owner account exists
-	baseURL        string // externally-reachable base URL (e.g. "https://sb.example.com")
-	skillCLI       []byte       // embedded CLI skill content (served at GET /v1/skills/cli)
-	mitm           *mitm.Proxy          // transparent MITM proxy; nil only when --mitm-port 0
-	logger         *slog.Logger         // structured logger for per-request observability
-	rateLimit      *ratelimit.Registry  // tiered rate limiter; shared with the MITM ingress
-	logSink        requestlog.Sink      // per-request persistence sink; never nil (Nop default)
+	httpServer  *http.Server
+	store       Store
+	encKey      []byte // 32-byte encryption key, held in memory while running
+	notifier    *notify.Notifier
+	initialized bool                // true when at least one owner account exists
+	baseURL     string              // externally-reachable base URL (e.g. "https://sb.example.com")
+	skillCLI    []byte              // embedded CLI skill content (served at GET /v1/skills/cli)
+	mitm        *mitm.Proxy         // transparent MITM proxy; nil only when --mitm-port 0
+	logger      *slog.Logger        // structured logger for per-request observability
+	rateLimit   *ratelimit.Registry // tiered rate limiter; shared with the MITM ingress
+	logSink     requestlog.Sink     // per-request persistence sink; never nil (Nop default)
 	// touchCache short-circuits per-request session-touch writes. With
 	// db.SetMaxOpenConns(1), every UPDATE — even a no-op — opens the
 	// single WAL writer slot. Caching the last-touch wall-clock per
@@ -87,7 +87,10 @@ type Server struct {
 	infisicalClient *infisical.Client
 	// infisicalSyncer is built in Run; exposed for manual-refresh RefreshOnce.
 	infisicalSyncer *infisical.Syncer
-	oauthRefresher  *oauth.Refresher
+	// infisicalDynamic resolves Infisical dynamic-secret leases on demand; built
+	// in Run alongside the syncer when a client is attached. Nil disables it.
+	infisicalDynamic *infisical.DynamicResolver
+	oauthRefresher   *oauth.Refresher
 }
 
 // lockVaultServices acquires the per-vault mutation lock. Callers MUST
@@ -139,12 +142,29 @@ func (s *Server) SessionResolver() brokercore.SessionResolver {
 // CredentialProvider returns a brokercore.CredentialProvider backed by
 // this server's store and encryption key.
 func (s *Server) CredentialProvider() brokercore.CredentialProvider {
-	return &brokercore.StoreCredentialProvider{
+	p := &brokercore.StoreCredentialProvider{
 		Store:      credentialStoreAdapter{s.store},
 		OAuthStore: credentialStoreAdapter{s.store},
 		EncKey:     s.encKey,
 		Refresher:  s.oauthRefresher,
 	}
+	// Assign only when non-nil so the interface stays nil (avoids a typed-nil
+	// interface that would pass `Dynamic != nil` and then panic).
+	if s.infisicalDynamic != nil {
+		p.Dynamic = s.infisicalDynamic
+	}
+	return p
+}
+
+// revokeDynamicLeases revokes a vault's outstanding dynamic-secret leases on
+// disconnect/reconfigure. The in-memory cache is evicted synchronously so no
+// stale lease is served after this returns; the upstream revoke is backgrounded
+// so a slow Infisical can't stall the response.
+func (s *Server) revokeDynamicLeases(vaultID string) {
+	if s.infisicalDynamic == nil {
+		return
+	}
+	s.infisicalDynamic.RevokeVaultAsync(vaultID)
 }
 
 // credentialStoreAdapter satisfies brokercore.CredentialStore by adding
@@ -298,6 +318,11 @@ type Store interface {
 	ReplaceVaultCredentialsForSync(ctx context.Context, vaultID, configJSON string, items []store.EncryptedKV) (applied bool, err error)
 	SetVaultExternalStore(ctx context.Context, p store.SetVaultExternalStoreParams) (*store.VaultCredentialStore, error)
 	DeleteVaultCredentialStore(ctx context.Context, vaultID string) error
+
+	// Dynamic-secret lease tracking (Infisical)
+	InsertDynamicSecretLease(ctx context.Context, lease store.DynamicSecretLease) error
+	DeleteDynamicSecretLease(ctx context.Context, leaseID string) error
+	ListDynamicSecretLeases(ctx context.Context) ([]store.DynamicSecretLease, error)
 
 	// Agents
 	CreateAgent(ctx context.Context, name, createdBy, role string) (*store.Agent, error)
@@ -471,7 +496,6 @@ func (s *Server) guardLastOwner(ctx context.Context, w http.ResponseWriter, acti
 	}
 	return false
 }
-
 
 // requireVaultAccess checks that the session has access to the given vault.
 // For scoped sessions (VaultID set): checks that the session's vault matches.
@@ -652,7 +676,6 @@ func (s *Server) requireProposalReview(w http.ResponseWriter, r *http.Request, v
 	// Instance-level session: require member+ (proxy-role actors cannot self-approve).
 	return s.requireVaultMember(w, r, vaultID)
 }
-
 
 // securityHeaders wraps a handler to set security headers on every response.
 func securityHeaders(next http.Handler) http.Handler {
@@ -930,6 +953,15 @@ func (s *Server) Start() error {
 		close(syncerDone)
 	}
 
+	// Dynamic-secret resolver: leases minted on demand from the proxy path.
+	// Sweep orphaned leases (rows surviving a prior process) in the background.
+	if s.infisicalDynamic == nil && s.infisicalClient != nil {
+		s.infisicalDynamic = infisical.NewDynamicResolver(s.store, s.infisicalClient, s.logger)
+	}
+	if s.infisicalDynamic != nil {
+		go s.infisicalDynamic.SweepOrphans(pruneCtx)
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		fmt.Printf("Agent Vault server listening on %s\n", s.baseURL)
@@ -994,6 +1026,12 @@ func (s *Server) Start() error {
 	case <-time.After(5 * time.Second):
 		fmt.Fprintln(os.Stderr, "warning: infisical syncer did not stop within 5s; skipping key wipe to avoid racing in-flight encrypts")
 		return nil
+	}
+
+	// Revoke outstanding dynamic-secret leases (best-effort, self-bounded).
+	// Independent of s.encKey: revocation needs only lease IDs + the client.
+	if s.infisicalDynamic != nil {
+		s.infisicalDynamic.Close(context.Background())
 	}
 
 	fmt.Println("server shut down gracefully")
