@@ -16,12 +16,14 @@ import (
 
 // TokenResponse holds the parsed token endpoint response.
 type TokenResponse struct {
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
-	TokenType    string    `json:"token_type"`
-	Scope        string    `json:"scope"`
-	ExpiresIn    int       `json:"expires_in"`
-	ExpiresAt    time.Time `json:"-"`
+	AccessToken           string    `json:"access_token"`
+	RefreshToken          string    `json:"refresh_token"`
+	TokenType             string    `json:"token_type"`
+	Scope                 string    `json:"scope"`
+	ExpiresIn             int       `json:"expires_in"`
+	ExpiresAt             time.Time `json:"-"`
+	RefreshTokenExpiresIn int       `json:"refresh_token_expires_in"`
+	RefreshTokenExpiresAt time.Time `json:"-"`
 }
 
 // ExchangeConfig configures an authorization-code token exchange.
@@ -188,6 +190,9 @@ func doTokenRequest(req *http.Request) (*TokenResponse, error) {
 	}
 	if tok.ExpiresIn > 0 {
 		tok.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	}
+	if tok.RefreshTokenExpiresIn > 0 {
+		tok.RefreshTokenExpiresAt = time.Now().Add(time.Duration(tok.RefreshTokenExpiresIn) * time.Second)
 	}
 	return &tok, nil
 }

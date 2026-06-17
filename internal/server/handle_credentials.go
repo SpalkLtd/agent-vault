@@ -212,6 +212,12 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 			}
 			entries = append(entries, entry)
 		}
+		// GitHub user-to-server credentials: tokens are minted on demand and are
+		// injection-only — the value is never exposed, even with reveal=true.
+		for _, g := range s.enumerateGitHubCredentials(ctx, ns.ID) {
+			keys = append(keys, g.Key)
+			entries = append(entries, credentialEntry{Key: g.Key, Type: credentialTypeGitHub, Unavailable: !g.Connected})
+		}
 	}
 
 	resp := credentialsListResponse{Keys: keys}
@@ -224,6 +230,10 @@ func (s *Server) handleCredentialsList(w http.ResponseWriter, r *http.Request) {
 // credentialTypeDynamic tags entries sourced from an Infisical dynamic-secret
 // lease rather than the local credentials table.
 const credentialTypeDynamic = "dynamic"
+
+// credentialTypeGitHub tags a GitHub user-to-server credential whose ghu_ token
+// is minted on demand and never persisted or revealed.
+const credentialTypeGitHub = "github"
 
 // enumerateDynamicCredentials returns the vault's leased dynamic-secret fields
 // as credential entries. Best-effort: a nil resolver or an upstream error

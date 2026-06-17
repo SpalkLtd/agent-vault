@@ -1199,6 +1199,24 @@ func (m *mockStore) DeleteCredentialOAuthState(_ context.Context, _ string) erro
 func (m *mockStore) ExpireCredentialOAuthStates(_ context.Context, _ time.Time) (int, error) {
 	return 0, nil
 }
+func (m *mockStore) GetGitHubAppCredential(_ context.Context, _, _ string) (*store.GitHubAppCredential, error) {
+	return nil, sql.ErrNoRows
+}
+func (m *mockStore) ListGitHubAppCredentials(_ context.Context, _ string) ([]store.GitHubAppCredential, error) {
+	return nil, nil
+}
+func (m *mockStore) SetGitHubAppCredential(_ context.Context, _ *store.GitHubAppCredential) error {
+	return nil
+}
+func (m *mockStore) UpdateGitHubRefreshToken(_ context.Context, _, _ string, _, _ []byte, _ *time.Time, _ string) error {
+	return nil
+}
+func (m *mockStore) UpdateGitHubMintError(_ context.Context, _, _, _ string) error {
+	return nil
+}
+func (m *mockStore) DeleteGitHubAppCredential(_ context.Context, _, _ string) error {
+	return nil
+}
 
 func TestHealthEndpoint(t *testing.T) {
 	srv := newTestServer()

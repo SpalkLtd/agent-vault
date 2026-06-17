@@ -173,6 +173,23 @@ agent-vault vault credential get <key>
 
 If a vault is connected to Infisical, any dynamic secrets at its path are also available as credentials, named `<DYNAMIC_SECRET_NAME>_<FIELD>` in UPPER_SNAKE_CASE (e.g. the `db-postgres` dynamic secret exposes `DB_POSTGRES_USERNAME`, `DB_POSTGRES_PASSWORD`). Reference these keys in a service's auth or substitutions like any other credential; the proxy mints a short-lived lease on first use and reuses it until it expires. Listing credentials shows these fields as rows tagged `type: dynamic` (listing mints a lease to enumerate them). No proposal is needed; these come from the connected Infisical store.
 
+## GitHub user-to-server tokens
+
+A vault may expose a GitHub credential (conventionally `GITHUB_TOKEN`) that is **minted on demand** rather than stored. Agent Vault issues a short-lived GitHub user-to-server access token (`ghu_…`) that acts **as the authorizing human**, and because a GitHub App is the actor, GitHub records the app acting *on behalf of* that user. You never see the token value (it is injection-only) — reference `GITHUB_TOKEN` in a service's auth like any other credential and the proxy injects a fresh token:
+
+- `api.github.com` → `Authorization: Bearer <GITHUB_TOKEN>`
+- `github.com` (git over HTTPS) → `Authorization: Basic` for `x-access-token:<GITHUB_TOKEN>`
+
+Both `gh` and `git push/fetch` over HTTPS work transparently through the proxy — no token handling on your side. Listing credentials shows the row tagged `type: github`; its value is never revealed. A human connects it once via `agent-vault vault credential github connect` (it is not something you create through a proposal).
+
+**Attribution — always co-author your commits.** Because the token acts as the human, your work would otherwise be indistinguishable from theirs. So when you create commits, add a co-author trailer so reviewers can see the change came from an AI agent:
+
+```
+Co-authored-by: Agent Vault Bot <bot@agent-vault.dev>
+```
+
+(Use the bot identity configured for your environment.) Keep the human as the commit author and add the bot as co-author — the PR/commit then visibly shows human + AI.
+
 ## WebSocket
 
 WSS and WS connections also go through the proxy with credential injection — in the handshake headers and in WebSocket text frames (when `websocket` is in the substitution surfaces). Just connect to the real WebSocket URL.

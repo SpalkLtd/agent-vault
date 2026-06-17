@@ -1,6 +1,8 @@
 # Design: GitHub user-to-server credentials (dynamic, short-lived, human-attributed)
 
-Status: **Draft / spec** — no code yet.
+Status: **Implemented** (backend + CLI + docs). Deferred: web UI rendering,
+auto-created service presets, and the HTTP connect→callback integration test —
+see [§13](#13-implementation-checklist).
 Scope: GitHub-specific. AWS/IAM is out of scope for v1 (see [§14](#14-future-aws-iam-not-in-v1)).
 
 ---
@@ -337,27 +339,28 @@ call to confirm in implementation.
 
 ## 13. Implementation checklist
 
-- [ ] Migration: `github_app_credentials` table.
-- [ ] Store: `GetGitHubAppCredential`, `ListGitHubAppCredentials`,
-      `SetGitHubAppCredential`, `UpdateGitHubRefreshToken`, `UpdateGitHubMintError`.
-- [ ] `internal/github`: `Resolver` implementing `brokercore.DynamicCredentialResolver`
+- [x] Migration `051_github_app_credentials.sql`.
+- [x] Store: `GetGitHubAppCredential`, `ListGitHubAppCredentials`,
+      `SetGitHubAppCredential`, `UpdateGitHubRefreshToken`, `UpdateGitHubMintError`,
+      `DeleteGitHubAppCredential` (`internal/store/github_credentials.go`).
+- [x] `internal/github.Resolver` implementing `brokercore.DynamicCredentialResolver`
       — in-memory cache, single-flight via `oauth.Refresher`, persist-before-serve
       rotation, identity capture, error mapping. Takes the DEK.
-- [ ] Composite `DynamicCredentialResolver` in `server.go` (GitHub then Infisical);
-      keep the `lateDynamicResolver` late-binding pattern.
-- [ ] Connect handler + callback (dedicated), GitHub preset, hard-require App
-      (reject when no `refresh_token`), capture identity via `GET /user`.
-- [ ] Verify `internal/oauth/oauth.go` sends `Accept: application/json`.
-- [ ] CLI: `credential github connect|status`.
-- [ ] Credentials list: enumerate `GITHUB_TOKEN` (no mint), value never shown.
-- [ ] UI: render GitHub row as `identity@github (via <agent>)`.
-- [ ] Service presets/docs: `api.github.com` (Bearer) + `github.com` (Basic x-access-token).
-- [ ] `cmd/skill_cli.md`: GitHub credential usage + `Co-authored-by` trailer convention.
-- [ ] Docs: `docs/learn/credentials.mdx`, `docs/learn/credential-stores.mdx`
-      (dynamic-secrets framing), `docs/reference/cli.mdx`, a GitHub guide; scan `docs/`.
-- [ ] Tests: rotation single-flight; persist-before-serve failure; revoked-token
-      re-connect; no-refresh-token connect rejection; injection for both services;
-      `ghu_` never persisted / never revealed.
+- [x] Composite resolver in `server.go` (`lateDynamicResolver`: GitHub then Infisical).
+- [x] Connect + callback + status handlers (`internal/server/handle_github.go`),
+      GitHub preset, hard-require App (reject when no `refresh_token`), identity via `GET /user`.
+- [x] `internal/oauth` sends `Accept: application/json`; added `refresh_token_expires_in`.
+- [x] CLI: `credential github connect|status` (`cmd/credential_github.go`).
+- [x] Credentials list: enumerate `GITHUB_TOKEN` (no mint), value never shown (`type: github`).
+- [x] `cmd/skill_cli.md`: GitHub credential usage + `Co-authored-by` trailer convention.
+- [x] Docs: `docs/learn/credentials.mdx`, `docs/reference/cli.mdx`.
+- [x] Tests: mint/cache, rotation persist-before-serve, single-flight, not-connected,
+      unknown-key fall-through, enumerate (`internal/github/resolver_test.go`).
+- [ ] **Deferred** — web UI rendering of the GitHub row (`identity@github (via <agent>)`).
+- [ ] **Deferred** — auto-created service presets (`api.github.com` Bearer / `github.com`
+      Basic); currently documented, operator wires the services.
+- [ ] **Deferred** — HTTP connect→callback integration test (needs the auth harness);
+      resolver-level behavior is covered.
 
 ---
 

@@ -633,6 +633,35 @@ description: "Complete reference for all Agent Vault CLI commands."
     |------|---------|-------------|
     | `--vault` | `default` | Target vault |
   </Accordion>
+
+  <Accordion title="agent-vault vault credential github connect">
+    ```bash
+    agent-vault vault credential github connect [flags]
+    ```
+
+    Connect a GitHub App and authorize a user, so Agent Vault can mint short-lived user-to-server tokens on demand. Prints an authorization URL to open in a browser, then waits for consent to complete. Requires a **GitHub App with "Expiring user authorization tokens" enabled** (an OAuth App issues no refresh token and is rejected). Requires member+ role on a built-in vault.
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--vault` | `default` | Target vault |
+    | `--key` | `GITHUB_TOKEN` | Credential key |
+    | `--client-id` | | GitHub App client ID (required) |
+    | `--client-secret` | | GitHub App client secret (required) |
+    | `--scopes` | | Comma-separated OAuth scopes (e.g. `repo,read:org`) |
+  </Accordion>
+
+  <Accordion title="agent-vault vault credential github status">
+    ```bash
+    agent-vault vault credential github status [flags]
+    ```
+
+    Show connection status for a GitHub credential: whether it is connected, the authorizing GitHub identity, the refresh-token expiry, and the last mint error if any. Requires member+ role.
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--vault` | `default` | Target vault |
+    | `--key` | `GITHUB_TOKEN` | Credential key |
+  </Accordion>
 </AccordionGroup>
 
 ## Proposals
