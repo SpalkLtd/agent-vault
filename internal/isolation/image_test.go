@@ -9,6 +9,40 @@ import (
 	"testing"
 )
 
+func TestImageTrusted_RequiresMatchingProvenanceLabel(t *testing.T) {
+	// SECURITY (MEDIUM): EnsureImage must not trust a locally-tagged image
+	// merely because the tag exists — a co-tenant, CI step, or the agent in a
+	// prior host-mode run can plant an arbitrary (firewall-skipping) image
+	// under the deterministic, publicly-known tag. Trust is established only by
+	// a build-time provenance label carrying the full asset hash.
+	full, err := assetsFullHash()
+	if err != nil {
+		t.Fatalf("assetsFullHash: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		labelVal string
+		fetchErr error
+		want     bool
+	}{
+		{"matching label is trusted", full, nil, true},
+		{"planted image, different label", "deadbeef" + full[8:], nil, false},
+		{"legacy/planted image, no label", "", nil, false},
+		{"tag does not exist", "", context.DeadlineExceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fetch := func(context.Context, string, string) (string, error) {
+				return tc.labelVal, tc.fetchErr
+			}
+			if got := imageTrusted(context.Background(), "agent-vault/isolation:abc", full, fetch); got != tc.want {
+				t.Errorf("imageTrusted = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAssetsHash_Format(t *testing.T) {
 	h, err := assetsHash()
 	if err != nil {
@@ -49,9 +83,9 @@ func TestUnpackAssets_WritesFilesWithModes(t *testing.T) {
 	}
 
 	expect := map[string]os.FileMode{
-		"Dockerfile":        0o644,
-		"entrypoint.sh":     0o755,
-		"init-firewall.sh":  0o755,
+		"Dockerfile":       0o644,
+		"entrypoint.sh":    0o755,
+		"init-firewall.sh": 0o755,
 	}
 	for name, wantMode := range expect {
 		p := filepath.Join(dir, name)
