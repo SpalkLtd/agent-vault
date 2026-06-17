@@ -54,10 +54,21 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				merged[idx].Enabled = p.Enabled
 			case exists:
 				next := toBrokerService(p)
-				// Empty Substitutions means "leave existing alone";
-				// callers clear by delete+recreate.
+				// Empty Substitutions means "leave existing substitutions
+				// alone" — but ONLY when the network destination (Host/Port)
+				// is unchanged. Relocating a credential-injecting substitution
+				// onto a new host must be declared explicitly in the proposal
+				// so it is visible in the approval diff; otherwise a reviewer
+				// could approve a host change without seeing that a decrypted
+				// credential rides along to the new destination (exfiltration
+				// past human approval). Callers clear by delete+recreate.
 				if len(p.Substitutions) == 0 {
-					next.Substitutions = merged[idx].Substitutions
+					if next.Host == merged[idx].Host && samePort(next.Port, merged[idx].Port) {
+						next.Substitutions = merged[idx].Substitutions
+					} else if len(merged[idx].Substitutions) > 0 {
+						warnings = append(warnings, fmt.Sprintf(
+							"service %q changed host/port; its existing substitutions were dropped — re-declare them in the proposal to keep credential injection", p.Name))
+					}
 				}
 				merged[idx] = next
 			default:
@@ -79,6 +90,15 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 	}
 
 	return merged, warnings
+}
+
+// samePort reports whether two optional port values denote the same
+// network destination (both unset, or equal values).
+func samePort(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func toBrokerService(p Service) broker.Service {
