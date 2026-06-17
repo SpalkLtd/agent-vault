@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,24 +140,23 @@ func TestHandleGitHubConnect(t *testing.T) {
 	t.Run("validation and auth errors", func(t *testing.T) {
 		srv, _, vaultID := ghTestServer(t)
 		cases := []struct {
-			name string
-			body []byte
-			sess string // vaultID for session, "" = no session
-			want int
+			name    string
+			body    []byte
+			sess    string // vaultID for session, "" = no session
+			want    int
+			wantMsg string
 		}{
-			{"bad json", []byte("{"), vaultID, http.StatusBadRequest},
-			{"bad key", connectBody("myvault", "bad key", "cid", "s", ""), vaultID, http.StatusBadRequest},
-			{"no client id", connectBody("myvault", "GITHUB_TOKEN", "", "s", ""), vaultID, http.StatusBadRequest},
-			{"vault not found", connectBody("nope", "GITHUB_TOKEN", "cid", "s", ""), vaultID, http.StatusNotFound},
-			{"no session", connectBody("myvault", "GITHUB_TOKEN", "cid", "s", ""), "", http.StatusForbidden},
+			{"bad json", []byte("{"), vaultID, http.StatusBadRequest, "Invalid request body"},
+			{"bad key", connectBody("myvault", "bad key", "cid", "s", ""), vaultID, http.StatusBadRequest, "Invalid credential key"},
+			{"no client id", connectBody("myvault", "GITHUB_TOKEN", "", "s", ""), vaultID, http.StatusBadRequest, "client_id"},
+			{"vault not found", connectBody("nope", "GITHUB_TOKEN", "cid", "s", ""), vaultID, http.StatusNotFound, "not found"},
+			{"no session", connectBody("myvault", "GITHUB_TOKEN", "cid", "s", ""), "", http.StatusForbidden, "Authentication required"},
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {
 				rec := httptest.NewRecorder()
 				srv.handleGitHubConnect(rec, scopedReq("POST", "/x", c.body, c.sess, "member"))
-				if rec.Code != c.want {
-					t.Fatalf("got %d want %d (%s)", rec.Code, c.want, rec.Body.String())
-				}
+				assertJSONError(t, rec, c.want, c.wantMsg)
 			})
 		}
 	})
@@ -170,18 +171,14 @@ func TestHandleGitHubConnect(t *testing.T) {
 		}
 		rec := httptest.NewRecorder()
 		srv.handleGitHubConnect(rec, scopedReq("POST", "/x", connectBody("myvault", "GITHUB_TOKEN", "cid", "s", ""), vaultID, "member"))
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("expected 409, got %d", rec.Code)
-		}
+		assertJSONError(t, rec, http.StatusConflict, "external credential store")
 	})
 
 	t.Run("encryption failure", func(t *testing.T) {
 		srv, _, vaultID := ghTestServer(t, withEncKey(make([]byte, 5))) // invalid AES key size
 		rec := httptest.NewRecorder()
 		srv.handleGitHubConnect(rec, scopedReq("POST", "/x", connectBody("myvault", "GITHUB_TOKEN", "cid", "s", ""), vaultID, "member"))
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 500, got %d", rec.Code)
-		}
+		assertJSONError(t, rec, http.StatusInternalServerError, "Encryption failed")
 	})
 }
 
@@ -221,6 +218,46 @@ func locationStatus(rec *httptest.ResponseRecorder) string {
 		return "error"
 	}
 	return loc
+}
+
+// locationMessage returns the decoded `message` query param of the redirect, so
+// tests can assert the specific failure mode (not merely that some error fired).
+func locationMessage(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	u, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	return u.Query().Get("message")
+}
+
+// assertErrorRedirect asserts an error redirect whose message contains want.
+func assertErrorRedirect(t *testing.T, rec *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	if locationStatus(rec) != "error" {
+		t.Fatalf("expected error redirect, got loc=%s", rec.Header().Get("Location"))
+	}
+	if msg := locationMessage(t, rec); !strings.Contains(msg, want) {
+		t.Fatalf("expected error message containing %q, got %q", want, msg)
+	}
+}
+
+// assertJSONError asserts a jsonError response with the given status and a body
+// whose "error" message contains want — pinning the specific failure mode.
+func assertJSONError(t *testing.T, rec *httptest.ResponseRecorder, status int, want string) {
+	t.Helper()
+	if rec.Code != status {
+		t.Fatalf("expected status %d, got %d (%s)", status, rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal error body: %v", err)
+	}
+	if !strings.Contains(body.Error, want) {
+		t.Fatalf("expected error message containing %q, got %q", want, body.Error)
+	}
 }
 
 func TestHandleGitHubCallback(t *testing.T) {
@@ -273,42 +310,32 @@ func TestHandleGitHubCallback(t *testing.T) {
 		raw := seedState(t, srv, st, vaultID, "GITHUB_TOKEN", nil, nil, false)
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=abc&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("expected error redirect for missing refresh token")
-		}
+		assertErrorRedirect(t, rec, "Expiring user authorization tokens")
 	})
 
 	t.Run("error redirects", func(t *testing.T) {
 		srv, st, vaultID := ghTestServer(t)
 
-		// Missing code/state with an explicit error_description.
+		// Missing code/state with an explicit error_description → surfaces it.
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?error_description=denied", nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("missing code/state should error")
-		}
+		assertErrorRedirect(t, rec, "denied")
 
 		// Missing code/state with no error params → default message branch.
 		rec = httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb", nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("bare callback should error")
-		}
+		assertErrorRedirect(t, rec, "Missing code or state parameter")
 
 		// Invalid state.
 		rec = httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state=bogus", nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("invalid state should error")
-		}
+		assertErrorRedirect(t, rec, "Invalid or expired OAuth state")
 
 		// Expired state.
 		raw := seedState(t, srv, st, vaultID, "GH_EXPIRED", nil, nil, true)
 		rec = httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("expired state should error")
-		}
+		assertErrorRedirect(t, rec, "OAuth state expired")
 	})
 
 	t.Run("client secret decrypt failure", func(t *testing.T) {
@@ -317,9 +344,7 @@ func TestHandleGitHubCallback(t *testing.T) {
 		raw := seedState(t, srv, st, vaultID, "GITHUB_TOKEN", []byte("0123456789abcdef"), make([]byte, 12), false)
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("decrypt failure should error")
-		}
+		assertErrorRedirect(t, rec, "Failed to decrypt client secret")
 	})
 
 	t.Run("token exchange failure", func(t *testing.T) {
@@ -330,9 +355,7 @@ func TestHandleGitHubCallback(t *testing.T) {
 		raw := seedState(t, srv, st, vaultID, "GITHUB_TOKEN", nil, nil, false)
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("exchange failure should error")
-		}
+		assertErrorRedirect(t, rec, "Token exchange failed")
 	})
 
 	t.Run("refresh token encrypt failure", func(t *testing.T) {
@@ -344,9 +367,7 @@ func TestHandleGitHubCallback(t *testing.T) {
 		raw := seedState(t, srv, st, vaultID, "GITHUB_TOKEN", nil, nil, false)
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("encrypt failure should error")
-		}
+		assertErrorRedirect(t, rec, "Failed to encrypt refresh token")
 	})
 
 	t.Run("config not found", func(t *testing.T) {
@@ -359,9 +380,7 @@ func TestHandleGitHubCallback(t *testing.T) {
 		})
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("missing config should error")
-		}
+		assertErrorRedirect(t, rec, "GitHub configuration not found")
 	})
 }
 
@@ -371,26 +390,20 @@ func TestHandleGitHubStatus(t *testing.T) {
 	srv, st, vaultID := ghTestServer(t)
 	ctx := context.Background()
 
-	// Not found.
+	// Credential not found (distinct from a missing vault).
 	rec := httptest.NewRecorder()
 	srv.handleGitHubStatus(rec, scopedReq("GET", "/s?vault=myvault&key=GITHUB_TOKEN", nil, vaultID, "member"))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for missing cred, got %d", rec.Code)
-	}
+	assertJSONError(t, rec, http.StatusNotFound, "GitHub credential")
 
 	// Vault not found.
 	rec = httptest.NewRecorder()
 	srv.handleGitHubStatus(rec, scopedReq("GET", "/s?vault=nope", nil, vaultID, "member"))
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for missing vault, got %d", rec.Code)
-	}
+	assertJSONError(t, rec, http.StatusNotFound, "Vault \"nope\" not found")
 
 	// No session → 403.
 	rec = httptest.NewRecorder()
 	srv.handleGitHubStatus(rec, scopedReq("GET", "/s?vault=myvault", nil, "", ""))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d", rec.Code)
-	}
+	assertJSONError(t, rec, http.StatusForbidden, "Authentication required")
 
 	// Connected credential.
 	_ = st.SetGitHubAppCredential(ctx, &store.GitHubAppCredential{VaultID: vaultID, CredentialKey: "GITHUB_TOKEN", ClientID: "cid"})
@@ -489,9 +502,7 @@ func TestGitHubHandlerStoreFaults(t *testing.T) {
 		srv := newTestServer(withStore(&faultStore{Store: st, failSet: true}))
 		rec := httptest.NewRecorder()
 		srv.handleGitHubConnect(rec, scopedReq("POST", "/x", connectBody, v.ID, "member"))
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("got %d", rec.Code)
-		}
+		assertJSONError(t, rec, http.StatusInternalServerError, "Failed to save GitHub configuration")
 	})
 
 	t.Run("connect state failure → 500", func(t *testing.T) {
@@ -501,9 +512,7 @@ func TestGitHubHandlerStoreFaults(t *testing.T) {
 		srv := newTestServer(withStore(&faultStore{Store: st, failState: true}))
 		rec := httptest.NewRecorder()
 		srv.handleGitHubConnect(rec, scopedReq("POST", "/x", connectBody, v.ID, "member"))
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("got %d", rec.Code)
-		}
+		assertJSONError(t, rec, http.StatusInternalServerError, "Failed to create OAuth state")
 	})
 
 	t.Run("status get failure → 500", func(t *testing.T) {
@@ -513,9 +522,7 @@ func TestGitHubHandlerStoreFaults(t *testing.T) {
 		srv := newTestServer(withStore(&faultStore{Store: st, getErr: errors.New("boom")}))
 		rec := httptest.NewRecorder()
 		srv.handleGitHubStatus(rec, scopedReq("GET", "/s?vault=myvault&key=GITHUB_TOKEN", nil, v.ID, "member"))
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("got %d", rec.Code)
-		}
+		assertJSONError(t, rec, http.StatusInternalServerError, "Failed to read GitHub credential")
 	})
 
 	t.Run("callback update failure → error redirect", func(t *testing.T) {
@@ -530,9 +537,7 @@ func TestGitHubHandlerStoreFaults(t *testing.T) {
 		raw := seedState(t, srv, st, v.ID, "GITHUB_TOKEN", nil, nil, false)
 		rec := httptest.NewRecorder()
 		srv.handleGitHubCallback(rec, scopedReq("GET", "/cb?code=c&state="+raw, nil, "", ""))
-		if locationStatus(rec) != "error" {
-			t.Fatalf("update failure should redirect with error")
-		}
+		assertErrorRedirect(t, rec, "Failed to store refresh token")
 	})
 }
 

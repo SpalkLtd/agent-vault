@@ -227,8 +227,9 @@ func TestEnumerate(t *testing.T) {
 
 func TestEnumerateError(t *testing.T) {
 	r := NewResolver(&fakeStore{listErr: errors.New("db down")}, testKey, testLogger())
-	if _, err := r.Enumerate(context.Background(), "v1"); err == nil {
-		t.Fatalf("expected error from Enumerate")
+	_, err := r.Enumerate(context.Background(), "v1")
+	if err == nil || !contains(err.Error(), "db down") {
+		t.Fatalf("expected propagated 'db down' error, got %v", err)
 	}
 }
 
@@ -261,10 +262,10 @@ func TestEvictVault(t *testing.T) {
 func TestResolveGetErrorAndNilCred(t *testing.T) {
 	ctx := context.Background()
 
-	// Generic store error propagates.
+	// Generic store error propagates verbatim.
 	r1 := NewResolver(&fakeStore{getErr: errors.New("db down")}, testKey, testLogger())
-	if _, ok, err := r1.Resolve(ctx, "v1", "GITHUB_TOKEN"); ok || err == nil {
-		t.Fatalf("expected (false, err) on store error, got ok=%v err=%v", ok, err)
+	if _, ok, err := r1.Resolve(ctx, "v1", "GITHUB_TOKEN"); ok || err == nil || !contains(err.Error(), "db down") {
+		t.Fatalf("expected (false, 'db down'), got ok=%v err=%v", ok, err)
 	}
 
 	// Nil credential (no row) → not a GitHub key.
@@ -284,19 +285,21 @@ func TestMintDecryptFailures(t *testing.T) {
 		VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
 		RefreshTokenCT: badCT, RefreshTokenNonce: badNonce,
 	}}, testKey, testLogger())
-	if _, _, err := r1.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
-		t.Fatalf("expected decrypt-refresh failure")
+	// Must fail specifically on the refresh-token decrypt, before anything else.
+	if _, _, err := r1.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil || !contains(err.Error(), "decrypt refresh token") {
+		t.Fatalf("expected 'decrypt refresh token' failure, got %v", err)
 	}
 
-	// Valid refresh token, undecryptable client secret.
+	// Valid refresh token, undecryptable client secret → must fail on the client
+	// secret decrypt (proves it got past the refresh-token decrypt).
 	rct, rnonce := enc(t, "ghr_x")
 	r2 := NewResolver(&fakeStore{cred: &store.GitHubAppCredential{
 		VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
 		RefreshTokenCT: rct, RefreshTokenNonce: rnonce,
 		ClientSecretCT: badCT, ClientSecretNonce: badNonce,
 	}}, testKey, testLogger())
-	if _, _, err := r2.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
-		t.Fatalf("expected decrypt-client-secret failure")
+	if _, _, err := r2.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil || !contains(err.Error(), "decrypt client secret") {
+		t.Fatalf("expected 'decrypt client secret' failure, got %v", err)
 	}
 }
 
@@ -321,19 +324,22 @@ func TestMintRefreshErrors(t *testing.T) {
 	fs := &fakeStore{cred: connected()}
 	r := NewResolver(fs, testKey, testLogger())
 	_, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN")
-	if err == nil || fs.mintErr == "" {
-		t.Fatalf("expected permanent mint error recorded, err=%v recorded=%q", err, fs.mintErr)
+	// Permanent failure must surface the actionable re-connect guidance, both in
+	// the returned error and the recorded last_mint_error.
+	if err == nil || !contains(err.Error(), "re-run") || !contains(fs.mintErr, "re-run") {
+		t.Fatalf("expected permanent 're-run' mint error, err=%v recorded=%q", err, fs.mintErr)
 	}
 
-	// Transient (500) → generic message.
+	// Transient (500) → generic mint failure, NOT the re-connect guidance.
 	ts500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(500)
 	}))
 	defer ts500.Close()
 	TokenURL = ts500.URL
 	defer func() { TokenURL = oldURL }()
-	if _, _, err := NewResolver(&fakeStore{cred: connected()}, testKey, testLogger()).Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
-		t.Fatalf("expected transient mint error")
+	_, _, err = NewResolver(&fakeStore{cred: connected()}, testKey, testLogger()).Resolve(ctx, "v1", "GITHUB_TOKEN")
+	if err == nil || !contains(err.Error(), "github mint failed") || contains(err.Error(), "re-run") {
+		t.Fatalf("expected transient 'github mint failed' (not re-run), got %v", err)
 	}
 }
 
@@ -353,17 +359,18 @@ func TestMintPersistAndEncryptFailures(t *testing.T) {
 	TokenURL = ts.URL
 	defer func() { TokenURL = oldURL }()
 
-	// Persisting the rotated refresh token fails → mint fails (never serve).
+	// Persisting the rotated refresh token fails → mint fails specifically there
+	// (proves the exchange succeeded and we stopped at persistence, never serving).
 	fs := &fakeStore{cred: connected(), updErr: errors.New("write failed")}
-	if _, _, err := NewResolver(fs, testKey, testLogger()).Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
-		t.Fatalf("expected persist failure to fail the mint")
+	if _, _, err := NewResolver(fs, testKey, testLogger()).Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil || !contains(err.Error(), "persist rotated refresh token") {
+		t.Fatalf("expected 'persist rotated refresh token' failure, got %v", err)
 	}
 
-	// Encrypting the rotated refresh token fails → mint fails.
+	// Encrypting the rotated refresh token fails → mint fails specifically there.
 	r := NewResolver(&fakeStore{cred: connected()}, testKey, testLogger())
 	r.encrypt = func(_, _ []byte) ([]byte, []byte, error) { return nil, nil, errors.New("enc fail") }
-	if _, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
-		t.Fatalf("expected encrypt failure to fail the mint")
+	if _, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil || !contains(err.Error(), "encrypt rotated refresh token") {
+		t.Fatalf("expected 'encrypt rotated refresh token' failure, got %v", err)
 	}
 }
 
@@ -421,8 +428,8 @@ func TestFetchIdentity(t *testing.T) {
 	}))
 	defer bad.Close()
 	UserURL = bad.URL
-	if _, err := FetchIdentity(context.Background(), "ghu_x"); err == nil {
-		t.Fatalf("expected error on 401")
+	if _, err := FetchIdentity(context.Background(), "ghu_x"); err == nil || !contains(err.Error(), "401") {
+		t.Fatalf("expected error mentioning 401, got %v", err)
 	}
 
 	// Transport error (unreachable URL).
