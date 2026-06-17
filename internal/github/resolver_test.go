@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,8 +11,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Infisical/agent-vault/internal/crypto"
+	"github.com/Infisical/agent-vault/internal/oauth"
 	"github.com/Infisical/agent-vault/internal/store"
 )
 
@@ -220,4 +223,293 @@ func TestEnumerate(t *testing.T) {
 	if len(creds) != 1 || creds[0].Key != "GITHUB_TOKEN" || !creds[0].Connected || creds[0].Identity != "alice" {
 		t.Fatalf("unexpected enumerate result: %+v", creds)
 	}
+}
+
+func TestEnumerateError(t *testing.T) {
+	r := NewResolver(&fakeStore{listErr: errors.New("db down")}, testKey, testLogger())
+	if _, err := r.Enumerate(context.Background(), "v1"); err == nil {
+		t.Fatalf("expected error from Enumerate")
+	}
+}
+
+func TestEvictVault(t *testing.T) {
+	var hits int32
+	ts := tokenServer(t, &hits)
+	defer ts.Close()
+	oldURL := TokenURL
+	TokenURL = ts.URL
+	defer func() { TokenURL = oldURL }()
+
+	st := newStore(t)
+	vaultID := seedConnected(t, st, "GITHUB_TOKEN", "ghr_initial")
+	r := NewResolver(st, testKey, testLogger())
+	ctx := context.Background()
+
+	if _, _, err := r.Resolve(ctx, vaultID, "GITHUB_TOKEN"); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	r.EvictVault(vaultID)       // drops the cached token
+	r.EvictVault("other-vault") // no-op, exercises the non-matching branch
+	if _, _, err := r.Resolve(ctx, vaultID, "GITHUB_TOKEN"); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("expected 2 mints after eviction, got %d", got)
+	}
+}
+
+func TestResolveGetErrorAndNilCred(t *testing.T) {
+	ctx := context.Background()
+
+	// Generic store error propagates.
+	r1 := NewResolver(&fakeStore{getErr: errors.New("db down")}, testKey, testLogger())
+	if _, ok, err := r1.Resolve(ctx, "v1", "GITHUB_TOKEN"); ok || err == nil {
+		t.Fatalf("expected (false, err) on store error, got ok=%v err=%v", ok, err)
+	}
+
+	// Nil credential (no row) → not a GitHub key.
+	r2 := NewResolver(&fakeStore{}, testKey, testLogger())
+	if _, ok, err := r2.Resolve(ctx, "v1", "GITHUB_TOKEN"); ok || err != nil {
+		t.Fatalf("expected (false, nil) on nil cred, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestMintDecryptFailures(t *testing.T) {
+	ctx := context.Background()
+
+	// Undecryptable refresh token (correct nonce length, wrong content → GCM
+	// auth failure, not a panic).
+	badCT, badNonce := []byte("0123456789abcdef"), make([]byte, 12)
+	r1 := NewResolver(&fakeStore{cred: &store.GitHubAppCredential{
+		VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
+		RefreshTokenCT: badCT, RefreshTokenNonce: badNonce,
+	}}, testKey, testLogger())
+	if _, _, err := r1.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
+		t.Fatalf("expected decrypt-refresh failure")
+	}
+
+	// Valid refresh token, undecryptable client secret.
+	rct, rnonce := enc(t, "ghr_x")
+	r2 := NewResolver(&fakeStore{cred: &store.GitHubAppCredential{
+		VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
+		RefreshTokenCT: rct, RefreshTokenNonce: rnonce,
+		ClientSecretCT: badCT, ClientSecretNonce: badNonce,
+	}}, testKey, testLogger())
+	if _, _, err := r2.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
+		t.Fatalf("expected decrypt-client-secret failure")
+	}
+}
+
+func TestMintRefreshErrors(t *testing.T) {
+	ctx := context.Background()
+	rct, rnonce := enc(t, "ghr_x")
+	connected := func() *store.GitHubAppCredential {
+		return &store.GitHubAppCredential{
+			VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
+			RefreshTokenCT: rct, RefreshTokenNonce: rnonce,
+		}
+	}
+
+	// Permanent (400) → actionable re-connect message + last_mint_error recorded.
+	ts400 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(400)
+		_, _ = io.WriteString(w, `{"error":"bad_refresh_token"}`)
+	}))
+	defer ts400.Close()
+	oldURL := TokenURL
+	TokenURL = ts400.URL
+	fs := &fakeStore{cred: connected()}
+	r := NewResolver(fs, testKey, testLogger())
+	_, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN")
+	if err == nil || fs.mintErr == "" {
+		t.Fatalf("expected permanent mint error recorded, err=%v recorded=%q", err, fs.mintErr)
+	}
+
+	// Transient (500) → generic message.
+	ts500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+	}))
+	defer ts500.Close()
+	TokenURL = ts500.URL
+	defer func() { TokenURL = oldURL }()
+	if _, _, err := NewResolver(&fakeStore{cred: connected()}, testKey, testLogger()).Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
+		t.Fatalf("expected transient mint error")
+	}
+}
+
+func TestMintPersistAndEncryptFailures(t *testing.T) {
+	ctx := context.Background()
+	rct, rnonce := enc(t, "ghr_x")
+	connected := func() *store.GitHubAppCredential {
+		return &store.GitHubAppCredential{
+			VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
+			RefreshTokenCT: rct, RefreshTokenNonce: rnonce,
+		}
+	}
+	var hits int32
+	ts := tokenServer(t, &hits)
+	defer ts.Close()
+	oldURL := TokenURL
+	TokenURL = ts.URL
+	defer func() { TokenURL = oldURL }()
+
+	// Persisting the rotated refresh token fails → mint fails (never serve).
+	fs := &fakeStore{cred: connected(), updErr: errors.New("write failed")}
+	if _, _, err := NewResolver(fs, testKey, testLogger()).Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
+		t.Fatalf("expected persist failure to fail the mint")
+	}
+
+	// Encrypting the rotated refresh token fails → mint fails.
+	r := NewResolver(&fakeStore{cred: connected()}, testKey, testLogger())
+	r.encrypt = func(_, _ []byte) ([]byte, []byte, error) { return nil, nil, errors.New("enc fail") }
+	if _, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN"); err == nil {
+		t.Fatalf("expected encrypt failure to fail the mint")
+	}
+}
+
+func TestMintExpiryFallback(t *testing.T) {
+	ctx := context.Background()
+	rct, rnonce := enc(t, "ghr_x")
+	// Token server returns a refresh token but NO expires_in → fallback TTL.
+	var hits int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = io.WriteString(w, `{"access_token":"ghu_x","refresh_token":"ghr_y"}`)
+	}))
+	defer ts.Close()
+	oldURL := TokenURL
+	TokenURL = ts.URL
+	defer func() { TokenURL = oldURL }()
+
+	r := NewResolver(&fakeStore{cred: &store.GitHubAppCredential{
+		VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
+		RefreshTokenCT: rct, RefreshTokenNonce: rnonce,
+	}}, testKey, testLogger())
+	tok, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN")
+	if err != nil || tok != "ghu_x" {
+		t.Fatalf("resolve: tok=%q err=%v", tok, err)
+	}
+	// Cached under the ~1h fallback TTL: a second resolve does not re-mint.
+	if _, _, err := r.Resolve(ctx, "v1", "GITHUB_TOKEN"); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("fallback TTL should cache; expected 1 hit, got %d", hits)
+	}
+}
+
+func TestFetchIdentity(t *testing.T) {
+	oldURL := UserURL
+	defer func() { UserURL = oldURL }()
+
+	// Success.
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer ghu_x" {
+			t.Errorf("missing bearer auth, got %q", got)
+		}
+		_, _ = io.WriteString(w, `{"login":"alice"}`)
+	}))
+	defer ok.Close()
+	UserURL = ok.URL
+	if login, err := FetchIdentity(context.Background(), "ghu_x"); err != nil || login != "alice" {
+		t.Fatalf("FetchIdentity success: login=%q err=%v", login, err)
+	}
+
+	// Non-2xx.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(401)
+	}))
+	defer bad.Close()
+	UserURL = bad.URL
+	if _, err := FetchIdentity(context.Background(), "ghu_x"); err == nil {
+		t.Fatalf("expected error on 401")
+	}
+
+	// Transport error (unreachable URL).
+	UserURL = "http://127.0.0.1:0/user"
+	if _, err := FetchIdentity(context.Background(), "ghu_x"); err == nil {
+		t.Fatalf("expected transport error")
+	}
+
+	// Malformed URL → request construction fails.
+	UserURL = "http://%zz"
+	if _, err := FetchIdentity(context.Background(), "ghu_x"); err == nil {
+		t.Fatalf("expected request-build error")
+	}
+
+	// 200 with invalid JSON body → decode error.
+	badJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "not json")
+	}))
+	defer badJSON.Close()
+	UserURL = badJSON.URL
+	if _, err := FetchIdentity(context.Background(), "ghu_x"); err == nil {
+		t.Fatalf("expected JSON decode error")
+	}
+}
+
+func TestResolveUnderFlightRecheck(t *testing.T) {
+	rct, rnonce := enc(t, "ghr_x")
+	r := NewResolver(&fakeStore{cred: &store.GitHubAppCredential{
+		VaultID: "v1", CredentialKey: "GITHUB_TOKEN", ClientID: "cid",
+		RefreshTokenCT: rct, RefreshTokenNonce: rnonce,
+	}}, testKey, testLogger())
+	// Simulate a concurrent flight completing between the outer cache miss and
+	// the single-flighted mint: populate a fresh cache entry, so the under-flight
+	// re-check returns it without minting.
+	r.afterOuterMiss = func() {
+		r.mu.Lock()
+		r.cache["v1|GITHUB_TOKEN"] = cachedToken{token: "ghu_cached", expireAt: time.Now().Add(time.Hour)}
+		r.mu.Unlock()
+	}
+	tok, ok, err := r.Resolve(context.Background(), "v1", "GITHUB_TOKEN")
+	if err != nil || !ok || tok != "ghu_cached" {
+		t.Fatalf("expected cached token from under-flight re-check, got tok=%q ok=%v err=%v", tok, ok, err)
+	}
+}
+
+func TestMintErrorMessage(t *testing.T) {
+	if msg := mintErrorMessage(&oauth.TokenError{StatusCode: 400, Permanent: true}); !contains(msg, "re-run") {
+		t.Fatalf("permanent error should suggest re-connect, got %q", msg)
+	}
+	if msg := mintErrorMessage(&oauth.TokenError{StatusCode: 429, Permanent: false}); !contains(msg, "429") {
+		t.Fatalf("transient error should pass through, got %q", msg)
+	}
+	if msg := mintErrorMessage(errors.New("network blip")); msg != "network blip" {
+		t.Fatalf("generic error should pass through, got %q", msg)
+	}
+}
+
+func contains(s, sub string) bool { return containsAll(s, sub) }
+
+// fakeStore is a configurable github.Store for error-path tests.
+type fakeStore struct {
+	cred    *store.GitHubAppCredential
+	getErr  error
+	listErr error
+	updErr  error
+	mintErr string // last recorded mint error
+}
+
+func (f *fakeStore) GetGitHubAppCredential(_ context.Context, _, _ string) (*store.GitHubAppCredential, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return f.cred, nil
+}
+func (f *fakeStore) ListGitHubAppCredentials(_ context.Context, _ string) ([]store.GitHubAppCredential, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	if f.cred != nil {
+		return []store.GitHubAppCredential{*f.cred}, nil
+	}
+	return nil, nil
+}
+func (f *fakeStore) UpdateGitHubRefreshToken(_ context.Context, _, _ string, _, _ []byte, _ *time.Time, _ string) error {
+	return f.updErr
+}
+func (f *fakeStore) UpdateGitHubMintError(_ context.Context, _, _, msg string) error {
+	f.mintErr = msg
+	return nil
 }

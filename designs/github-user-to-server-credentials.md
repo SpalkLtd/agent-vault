@@ -355,12 +355,16 @@ call to confirm in implementation.
 - [x] `cmd/skill_cli.md`: GitHub credential usage + `Co-authored-by` trailer convention.
 - [x] Docs: `docs/learn/credentials.mdx`, `docs/reference/cli.mdx`.
 - [x] Tests: mint/cache, rotation persist-before-serve, single-flight, not-connected,
-      unknown-key fall-through, enumerate (`internal/github/resolver_test.go`).
+      unknown-key fall-through, enumerate, identity capture, error mapping
+      (`internal/github/resolver_test.go`); store CRUD + DB-error paths
+      (`internal/store/github_credentials_test.go`); connect/callback/status handler
+      flow incl. hard-require-app rejection, fault injection, and default-vault
+      (`internal/server/handle_github_test.go`). **100% statement coverage of new code**
+      except one unreachable defensive `rows.Scan` guard in `ListGitHubAppCredentials`.
+      Two spec-critical tests mutation-verified (persist-before-serve; hard-require app).
 - [ ] **Deferred** — web UI rendering of the GitHub row (`identity@github (via <agent>)`).
 - [ ] **Deferred** — auto-created service presets (`api.github.com` Bearer / `github.com`
       Basic); currently documented, operator wires the services.
-- [ ] **Deferred** — HTTP connect→callback integration test (needs the auth harness);
-      resolver-level behavior is covered.
 
 ---
 

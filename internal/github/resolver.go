@@ -34,8 +34,8 @@ const (
 var (
 	AuthorizeURL = "https://github.com/login/oauth/authorize"
 	TokenURL     = "https://github.com/login/oauth/access_token"
-	// userURL returns the authenticated user, used to capture the human identity.
-	userURL = "https://api.github.com/user"
+	// UserURL returns the authenticated user, used to capture the human identity.
+	UserURL = "https://api.github.com/user"
 )
 
 // Store is the slice of the persistence layer the resolver needs.
@@ -59,6 +59,13 @@ type Resolver struct {
 	refresher *oauth.Refresher
 	logger    *slog.Logger
 	clock     func() time.Time
+	// encrypt is crypto.Encrypt in production; a field so tests can force the
+	// (otherwise key-size-only) failure of persisting a rotated refresh token.
+	encrypt func(plaintext, key []byte) (ct, nonce []byte, err error)
+	// afterOuterMiss is nil in production; a test hook fired after the lock-free
+	// cache miss and before the single-flighted mint, to deterministically
+	// exercise the under-flight re-check (otherwise only reachable via a race).
+	afterOuterMiss func()
 
 	mu    sync.Mutex
 	cache map[string]cachedToken // vaultID|key -> live token
@@ -72,6 +79,7 @@ func NewResolver(s Store, encKey []byte, logger *slog.Logger) *Resolver {
 		refresher: oauth.NewRefresher(),
 		logger:    logger,
 		clock:     time.Now,
+		encrypt:   crypto.Encrypt,
 		cache:     make(map[string]cachedToken),
 	}
 }
@@ -102,6 +110,10 @@ func (r *Resolver) Resolve(ctx context.Context, vaultID, key string) (string, bo
 		return c.token, true, nil
 	}
 	r.mu.Unlock()
+
+	if r.afterOuterMiss != nil {
+		r.afterOuterMiss()
+	}
 
 	// Single-flight the mint: the refresh token rotates, so concurrent mints
 	// would race and could invalidate the chain. This is correctness, not just
@@ -156,7 +168,7 @@ func (r *Resolver) mint(ctx context.Context, cred *store.GitHubAppCredential) oa
 	// whole mint — never serve a token whose new refresh token wasn't saved, or
 	// the chain is lost.
 	if tok.RefreshToken != "" {
-		rct, rnonce, err := crypto.Encrypt([]byte(tok.RefreshToken), r.encKey)
+		rct, rnonce, err := r.encrypt([]byte(tok.RefreshToken), r.encKey)
 		if err != nil {
 			return oauth.RefreshResult{Err: fmt.Errorf("encrypt rotated refresh token: %w", err)}
 		}
@@ -233,7 +245,7 @@ var apiClient = func() *http.Client {
 // FetchIdentity returns the GitHub login for an access token (GET /user).
 // Best-effort: callers may proceed with an empty identity on error.
 func FetchIdentity(ctx context.Context, accessToken string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, UserURL, nil)
 	if err != nil {
 		return "", err
 	}
