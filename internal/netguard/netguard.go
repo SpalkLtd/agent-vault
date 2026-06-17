@@ -90,11 +90,17 @@ func ParseCIDRList(raw, envName string) []net.IPNet {
 	return out
 }
 
-// alwaysBlocked contains IP ranges that are blocked regardless of policy.
-// These are metadata service endpoints and other dangerous destinations.
+// alwaysBlocked contains IP ranges that are blocked regardless of policy
+// (checked before the allowPrivate short-circuit and the allowlist). These
+// are cloud metadata / instance-credential endpoints and other dangerous
+// destinations that must never be reachable through the proxy.
 var alwaysBlocked = []net.IPNet{
-	// AWS/GCP/Azure IMDS
+	// AWS/GCP/Azure/Oracle IMDS
 	parseCIDR("169.254.169.254/32"),
+	// AWS ECS/EKS task-role credential endpoint (AWS_CONTAINER_CREDENTIALS_*)
+	parseCIDR("169.254.170.2/32"),
+	// Alibaba Cloud / OpenStack IMDS
+	parseCIDR("100.100.100.200/32"),
 	// AWS IMDSv2 IPv6
 	parseCIDR("fd00:ec2::254/128"),
 }
@@ -121,6 +127,8 @@ var privateRanges = []net.IPNet{
 	parseCIDR("fc00::/7"),
 	// 0.0.0.0 (often routes to localhost)
 	parseCIDR("0.0.0.0/32"),
+	// :: (IPv6 unspecified — routes to loopback like 0.0.0.0)
+	parseCIDR("::/128"),
 }
 
 func parseCIDR(s string) net.IPNet {

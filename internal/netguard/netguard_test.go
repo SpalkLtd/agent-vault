@@ -29,6 +29,39 @@ func TestIsBlockedIP_AlwaysBlocked(t *testing.T) {
 	}
 }
 
+func TestIsBlockedIP_UnspecifiedAddresses(t *testing.T) {
+	// SECURITY (HIGH): the IPv6 unspecified address :: routes to loopback on
+	// Linux/macOS exactly like 0.0.0.0, so it must be blocked when private
+	// ranges are blocked. Previously :: was omitted from privateRanges.
+	for _, ip := range []string{"0.0.0.0", "::"} {
+		if !isBlockedIP(net.ParseIP(ip), false, nil) {
+			t.Errorf("%s should be blocked when private ranges are blocked (routes to loopback)", ip)
+		}
+	}
+}
+
+func TestIsBlockedIP_MetadataAlwaysBlocked(t *testing.T) {
+	// SECURITY (MEDIUM): cloud metadata / instance-credential endpoints must be
+	// blocked regardless of AGENT_VAULT_ALLOW_PRIVATE_RANGES. Previously only
+	// 169.254.169.254 and fd00:ec2::254 were in the always-blocked set, so the
+	// AWS ECS task-role endpoint and Alibaba IMDS leaked when allowPrivate=true.
+	metadata := []string{
+		"169.254.169.254", // AWS/GCP/Azure IMDS
+		"169.254.170.2",   // AWS ECS/EKS task-role credentials endpoint
+		"100.100.100.200", // Alibaba Cloud IMDS
+	}
+	for _, ip := range metadata {
+		if !isBlockedIP(net.ParseIP(ip), true, nil) {
+			t.Errorf("%s (cloud metadata) should be blocked even when private ranges are allowed", ip)
+		}
+		// Allowlisting must not bypass metadata blocking either.
+		allow := []net.IPNet{parseCIDR(ip + "/32")}
+		if !isBlockedIP(net.ParseIP(ip), false, allow) {
+			t.Errorf("%s (cloud metadata) should be blocked even when allowlisted", ip)
+		}
+	}
+}
+
 func TestIsBlockedIP_AllowPrivate(t *testing.T) {
 	// When private ranges are allowed, RFC-1918 etc. should NOT be blocked.
 	cases := []string{
