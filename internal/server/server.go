@@ -20,6 +20,7 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/crypto"
+	"github.com/Infisical/agent-vault/internal/github"
 	"github.com/Infisical/agent-vault/internal/infisical"
 	"github.com/Infisical/agent-vault/internal/mitm"
 	"github.com/Infisical/agent-vault/internal/netguard"
@@ -91,7 +92,10 @@ type Server struct {
 	// infisicalDynamic resolves Infisical dynamic-secret leases on demand; built
 	// in Run alongside the syncer when a client is attached. Nil disables it.
 	infisicalDynamic *infisical.DynamicResolver
-	oauthRefresher   *oauth.Refresher
+	// githubDynamic mints short-lived GitHub App installation tokens on demand;
+	// built in Start(). Independent of Infisical.
+	githubDynamic  *github.Resolver
+	oauthRefresher *oauth.Refresher
 	telemetry        *telemetry.Telemetry
 }
 
@@ -209,6 +213,14 @@ func (s *Server) CredentialProvider() brokercore.CredentialProvider {
 type lateDynamicResolver struct{ s *Server }
 
 func (l lateDynamicResolver) Resolve(ctx context.Context, vaultID, key string) (string, bool, error) {
+	// GitHub first: it owns keys backed by a github_app_installations row and
+	// returns ok=false for everything else. A real error (not connected, mint
+	// failed) short-circuits — the key matched, so don't fall through.
+	if l.s.githubDynamic != nil {
+		if v, ok, err := l.s.githubDynamic.Resolve(ctx, vaultID, key); err != nil || ok {
+			return v, ok, err
+		}
+	}
 	if l.s.infisicalDynamic == nil {
 		return "", false, nil
 	}
@@ -319,6 +331,14 @@ type Store interface {
 	GetCredentialOAuthStateByHash(ctx context.Context, stateHash string) (*store.CredentialOAuthState, error)
 	DeleteCredentialOAuthState(ctx context.Context, id string) error
 	ExpireCredentialOAuthStates(ctx context.Context, before time.Time) (int, error)
+
+	// GitHub App installation credentials (durable secret; tokens minted on demand)
+	GetGitHubAppInstallation(ctx context.Context, vaultID, key string) (*store.GitHubAppInstallation, error)
+	ListGitHubAppInstallations(ctx context.Context, vaultID string) ([]store.GitHubAppInstallation, error)
+	SetGitHubAppInstallation(ctx context.Context, g *store.GitHubAppInstallation) error
+	UpdateGitHubInstallationMeta(ctx context.Context, vaultID, key, appSlug string) error
+	UpdateGitHubInstallationMintError(ctx context.Context, vaultID, key, errMsg string) error
+	DeleteGitHubAppInstallation(ctx context.Context, vaultID, key string) (bool, error)
 
 	// Broker configs
 	GetBrokerConfig(ctx context.Context, vaultID string) (*store.BrokerConfig, error)
@@ -829,6 +849,10 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	mux.HandleFunc("GET /v1/credentials/oauth/status", s.requireInitialized(s.requireAuth(actorAuthed(s.handleOAuthStatus))))
 	mux.HandleFunc("POST /v1/credentials/oauth/tokens", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleOAuthTokenUpload)))))
 
+	// GitHub App installation credential flow (server-to-server).
+	mux.HandleFunc("POST /v1/credentials/github/connect", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleGitHubConnect)))))
+	mux.HandleFunc("GET /v1/credentials/github/status", s.requireInitialized(s.requireAuth(actorAuthed(s.handleGitHubStatus))))
+
 	mux.HandleFunc("GET /discover", s.requireInitialized(s.requireAuth(actorAuthed(s.handleDiscover))))
 	mux.HandleFunc("POST /v1/proposals", s.requireInitialized(s.requireAuth(actorAuthed(limitBody(s.handleProposalCreate)))))
 	mux.HandleFunc("GET /v1/proposals/{id}", s.requireInitialized(s.requireAuth(actorAuthed(s.handleProposalGet))))
@@ -1019,6 +1043,12 @@ func (s *Server) Start() error {
 	}
 	if s.infisicalDynamic != nil {
 		go s.infisicalDynamic.SweepOrphans(pruneCtx)
+	}
+
+	// GitHub App installation-token resolver: mints ghs_ tokens on demand. No
+	// external dependency, so always built.
+	if s.githubDynamic == nil {
+		s.githubDynamic = github.NewResolver(s.store, s.encKey, s.logger)
 	}
 
 	errCh := make(chan error, 1)

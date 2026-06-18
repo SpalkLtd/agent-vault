@@ -627,11 +627,42 @@ description: "Complete reference for all Agent Vault CLI commands."
     agent-vault vault credential delete <KEY> [KEY2 ...] [flags]
     ```
 
-    Delete one or more credentials. Alias: `agent-vault vault creds delete`. In agent mode (`AGENT_VAULT_TOKEN` set), `AGENT_VAULT_VAULT` (or `--vault`) is required — there is no project-file or interactive-picker fallback.
+    Delete one or more credentials. Alias: `agent-vault vault creds delete`. Removes static credentials as well as GitHub App installation credentials (`type: github`, including the stored App private key). In agent mode (`AGENT_VAULT_TOKEN` set), `AGENT_VAULT_VAULT` (or `--vault`) is required — there is no project-file or interactive-picker fallback.
 
     | Flag | Default | Description |
     |------|---------|-------------|
     | `--vault` | `default` | Target vault |
+  </Accordion>
+
+  <Accordion title="agent-vault vault credential github connect">
+    ```bash
+    agent-vault vault credential github connect [flags]
+    ```
+
+    Connect a GitHub App installation so Agent Vault can mint short-lived `ghs_` installation access tokens on demand (server-to-server). Non-interactive — no browser flow. Validates by minting one token. Requires member+ role on a built-in vault. The minted token acts as the App/bot and is injection-only (never revealed).
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--vault` | `default` | Target vault |
+    | `--key` | `GITHUB` | Credential key |
+    | `--app-id` | | GitHub App id or client id (JWT issuer) (required) |
+    | `--installation-id` | | Installation id the token is minted for (required) |
+    | `--private-key-file` | | Path to the App private key `.pem` (required) |
+    | `--permissions` | | Optional JSON permission subset, e.g. `{"contents":"write"}` |
+    | `--repositories` | | Optional comma-separated repo names to scope the token to |
+  </Accordion>
+
+  <Accordion title="agent-vault vault credential github status">
+    ```bash
+    agent-vault vault credential github status [flags]
+    ```
+
+    Show connection status for a GitHub credential: connected state, the App identity (`<slug>[bot]`), app/installation ids, last mint time, and the last mint error if any. Requires member+ role.
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `--vault` | `default` | Target vault |
+    | `--key` | `GITHUB` | Credential key |
   </Accordion>
 </AccordionGroup>
 

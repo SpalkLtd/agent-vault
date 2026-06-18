@@ -173,6 +173,21 @@ agent-vault vault credential get <key>
 
 If a vault is connected to Infisical, any dynamic secrets at its path are also available as credentials, named `<DYNAMIC_SECRET_NAME>_<FIELD>` in UPPER_SNAKE_CASE (e.g. the `db-postgres` dynamic secret exposes `DB_POSTGRES_USERNAME`, `DB_POSTGRES_PASSWORD`). Reference these keys in a service's auth or substitutions like any other credential; the proxy mints a short-lived lease on first use and reuses it until it expires. Listing credentials shows these fields as rows tagged `type: dynamic` (listing mints a lease to enumerate them). No proposal is needed; these come from the connected Infisical store.
 
+## GitHub App tokens
+
+A vault may expose a GitHub credential (conventionally `GITHUB`) that is **minted on demand**. Agent Vault issues a short-lived GitHub App **installation** access token (`ghs_…`) that acts **as the App/bot**. You never see the token value (injection-only) — reference `GITHUB` in a service's auth and the proxy injects a fresh token:
+
+- `api.github.com` → `Authorization: Bearer <GITHUB>`
+- `github.com` (git over HTTPS) → `Authorization: Basic` for `x-access-token:<GITHUB>`
+
+Both `gh` and `git push/fetch` over HTTPS work transparently through the proxy. Listing credentials shows the row tagged `type: github`; its value is never revealed. A human connects it once via `agent-vault vault credential github connect` (App id + installation id + private key) — not via a proposal.
+
+**Attribution — always co-author your commits.** These tokens act as the **bot**, so GitHub attributes actions to the App, not to a person. So reviewers can see which human is behind a change, add a co-author trailer to your commits:
+
+```
+Co-authored-by: <Human Name> <human@example.com>
+```
+
 ## WebSocket
 
 WSS and WS connections also go through the proxy with credential injection — in the handshake headers and in WebSocket text frames (when `websocket` is in the substitution surfaces). Just connect to the real WebSocket URL.
