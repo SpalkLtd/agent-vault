@@ -105,31 +105,18 @@ var alwaysBlocked = []net.IPNet{
 	parseCIDR("fd00:ec2::254/128"),
 }
 
-// privateRanges contains RFC-1918 and other private/reserved ranges.
-// Blocked unless AGENT_VAULT_ALLOW_PRIVATE_RANGES=true or the IP is in the
-// AGENT_VAULT_NETWORK_ALLOWLIST.
-var privateRanges = []net.IPNet{
-	// IPv4 private
-	parseCIDR("10.0.0.0/8"),
-	parseCIDR("172.16.0.0/12"),
-	parseCIDR("192.168.0.0/16"),
-	// IPv4 loopback
-	parseCIDR("127.0.0.0/8"),
-	// IPv4 link-local
-	parseCIDR("169.254.0.0/16"),
-	// IPv4 shared address space (CGN)
-	parseCIDR("100.64.0.0/10"),
-	// IPv6 loopback
-	parseCIDR("::1/128"),
-	// IPv6 link-local
-	parseCIDR("fe80::/10"),
-	// IPv6 unique local
-	parseCIDR("fc00::/7"),
-	// 0.0.0.0 (often routes to localhost)
-	parseCIDR("0.0.0.0/32"),
-	// :: (IPv6 unspecified — routes to loopback like 0.0.0.0)
-	parseCIDR("::/128"),
-}
+// carrierGradeNAT is RFC 6598 shared address space (100.64.0.0/10). It is
+// private/reserved but net.IP.IsPrivate does NOT cover it, so it is checked
+// explicitly alongside the stdlib predicates in isBlockedIP.
+var carrierGradeNAT = parseCIDR("100.64.0.0/10")
+
+// nat64WellKnownPrefix is RFC 6052 64:ff9b::/96. Addresses in this prefix
+// embed an IPv4 address in their low 32 bits; a NAT64 host translates them to
+// that IPv4 (e.g. 64:ff9b::a9fe:a9fe → 169.254.169.254). isBlockedIP unwraps
+// the embedded IPv4 and evaluates it under the same policy so NAT64 cannot
+// smuggle a request past the IPv4 rules. No stdlib predicate catches these —
+// they look like ordinary global IPv6 unicast.
+var nat64WellKnownPrefix = parseCIDR("64:ff9b::/96")
 
 func parseCIDR(s string) net.IPNet {
 	_, ipNet, err := net.ParseCIDR(s)
@@ -139,10 +126,22 @@ func parseCIDR(s string) net.IPNet {
 	return *ipNet
 }
 
-// isBlockedIP checks if an IP is blocked. When allowPrivate is false,
-// private/reserved ranges are blocked unless the IP is in the allowlist.
-// IMDS endpoints are always blocked, even when allowlisted.
+// isBlockedIP checks if an IP is blocked. Cloud metadata endpoints are always
+// blocked. When allowPrivate is false, private/reserved ranges are also
+// blocked unless the IP is in the allowlist.
+//
+// Private/reserved matching uses the stdlib net.IP predicates rather than a
+// hand-maintained CIDR list, so unspecified (0.0.0.0, ::), loopback, RFC1918,
+// IPv6 ULA, link-local unicast (incl. all of 169.254.0.0/16) and link-local
+// multicast — for both IPv4 and IPv4-mapped IPv6 — are covered without
+// enumeration. CGN (RFC6598) is added explicitly because IsPrivate omits it.
 func isBlockedIP(ip net.IP, allowPrivate bool, allowed []net.IPNet) bool {
+	// NAT64: unwrap the embedded IPv4 and evaluate it under the same policy.
+	if len(ip) == net.IPv6len && nat64WellKnownPrefix.Contains(ip) {
+		embedded := net.IP(ip[len(ip)-net.IPv4len:])
+		return isBlockedIP(embedded, allowPrivate, allowed)
+	}
+
 	for _, n := range alwaysBlocked {
 		if n.Contains(ip) {
 			return true
@@ -159,13 +158,12 @@ func isBlockedIP(ip net.IP, allowPrivate bool, allowed []net.IPNet) bool {
 		}
 	}
 
-	for _, n := range privateRanges {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
+	return ip.IsUnspecified() ||
+		ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		carrierGradeNAT.Contains(ip)
 }
 
 // SafeDialContext returns a DialContext function that blocks connections to

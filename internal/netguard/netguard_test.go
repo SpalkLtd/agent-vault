@@ -62,6 +62,75 @@ func TestIsBlockedIP_MetadataAlwaysBlocked(t *testing.T) {
 	}
 }
 
+func TestIsBlockedIP_PredicateCoverage(t *testing.T) {
+	// Regression guard for the predicate-based rewrite of the private/reserved
+	// matcher: every range the legacy hand-maintained list covered must stay
+	// blocked when private ranges are disabled, PLUS the additional reserved
+	// forms the stdlib predicates now cover without enumeration.
+	blocked := []string{
+		// Previously enumerated ranges — must remain blocked.
+		"10.1.2.3",        // RFC1918
+		"172.16.5.4",      // RFC1918
+		"192.168.1.1",     // RFC1918
+		"127.0.0.1",       // IPv4 loopback
+		"169.254.1.1",     // IPv4 link-local (all of 169.254.0.0/16)
+		"169.254.255.254", // IPv4 link-local upper
+		"100.64.0.1",      // CGN (RFC6598) lower
+		"100.127.255.254", // CGN (RFC6598) upper
+		"::1",             // IPv6 loopback
+		"fe80::1",         // IPv6 link-local
+		"fc00::1",         // IPv6 unique-local
+		"fd12:3456::1",    // IPv6 unique-local
+		"0.0.0.0",         // IPv4 unspecified
+		"::",              // IPv6 unspecified
+		// Newly covered by predicates (no enumeration needed).
+		"224.0.0.1", // IPv4 link-local multicast
+		"ff02::1",   // IPv6 link-local multicast
+	}
+	for _, ip := range blocked {
+		if !isBlockedIP(net.ParseIP(ip), false, nil) {
+			t.Errorf("%s should be blocked when private ranges are blocked", ip)
+		}
+	}
+
+	// Public unicast must remain reachable.
+	for _, ip := range []string{"8.8.8.8", "1.1.1.1", "104.18.0.1", "2606:4700::1111"} {
+		if isBlockedIP(net.ParseIP(ip), false, nil) {
+			t.Errorf("%s should NOT be blocked (public unicast)", ip)
+		}
+	}
+}
+
+func TestIsBlockedIP_NAT64(t *testing.T) {
+	// SECURITY: the RFC 6052 NAT64 well-known prefix 64:ff9b::/96 embeds an
+	// IPv4 address in its low 32 bits; a NAT64 host translates these to the
+	// embedded IPv4. So 64:ff9b::a9fe:a9fe reaches 169.254.169.254 (IMDS) and
+	// 64:ff9b::0a00:0001 reaches 10.0.0.1. The embedded IPv4 must be evaluated
+	// under the same policy so NAT64 can't smuggle past the v4 rules. No stdlib
+	// predicate catches these — they look like ordinary global IPv6 unicast.
+
+	// IMDS via NAT64: always blocked, even when private ranges are allowed.
+	imds64 := net.ParseIP("64:ff9b::a9fe:a9fe") // == 169.254.169.254
+	if !isBlockedIP(imds64, true, nil) {
+		t.Error("NAT64-embedded IMDS (64:ff9b::a9fe:a9fe) must be blocked even with allowPrivate")
+	}
+	// ECS task-role via NAT64.
+	ecs64 := net.ParseIP("64:ff9b::a9fe:aa02") // == 169.254.170.2
+	if !isBlockedIP(ecs64, true, nil) {
+		t.Error("NAT64-embedded ECS endpoint must be blocked even with allowPrivate")
+	}
+	// RFC1918 via NAT64: blocked when private ranges are blocked.
+	priv64 := net.ParseIP("64:ff9b::0a00:0001") // == 10.0.0.1
+	if !isBlockedIP(priv64, false, nil) {
+		t.Error("NAT64-embedded RFC1918 (10.0.0.1) must be blocked when private ranges are blocked")
+	}
+	// Public IPv4 via NAT64: legitimate translation, must NOT be blocked.
+	pub64 := net.ParseIP("64:ff9b::0808:0808") // == 8.8.8.8
+	if isBlockedIP(pub64, false, nil) {
+		t.Error("NAT64-embedded public IPv4 (8.8.8.8) should not be blocked")
+	}
+}
+
 func TestIsBlockedIP_AllowPrivate(t *testing.T) {
 	// When private ranges are allowed, RFC-1918 etc. should NOT be blocked.
 	cases := []string{
