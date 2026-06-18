@@ -28,8 +28,8 @@ package mitm
 
 import (
 	"context"
-	"log/slog"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -57,6 +57,7 @@ type Proxy struct {
 	logSink          requestlog.Sink     // never nil (Nop default); shared with the HTTP server
 	maxResponseBytes int64               // 0 = unlimited
 	maxRequestBytes  int64
+	connectSem       chan struct{} // bounds concurrent CONNECT tunnels
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -75,7 +76,15 @@ type Options struct {
 	LogSink          requestlog.Sink // nil → Nop
 	MaxResponseBytes int64           // 0 = unlimited (default); >0 = cap in bytes
 	MaxRequestBytes  int64           // 0 → DefaultMaxRequestBytes (1 GiB)
+	// MaxConcurrentTunnels bounds simultaneously-open CONNECT tunnels so a
+	// single authenticated actor cannot exhaust proxy fds/goroutines. 0 →
+	// DefaultMaxConcurrentTunnels.
+	MaxConcurrentTunnels int
 }
+
+// DefaultMaxConcurrentTunnels caps concurrently-open CONNECT tunnels when
+// Options.MaxConcurrentTunnels is unset.
+const DefaultMaxConcurrentTunnels = 256
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
 // listening until ListenAndServe is called.
@@ -100,6 +109,11 @@ func New(addr string, opts Options) *Proxy {
 		maxReq = brokercore.DefaultMaxRequestBytes
 	}
 
+	maxTunnels := opts.MaxConcurrentTunnels
+	if maxTunnels <= 0 {
+		maxTunnels = DefaultMaxConcurrentTunnels
+	}
+
 	p := &Proxy{
 		ca:               opts.CA,
 		sessions:         opts.Sessions,
@@ -111,6 +125,7 @@ func New(addr string, opts Options) *Proxy {
 		logSink:          sink,
 		maxResponseBytes: opts.MaxResponseBytes, // 0 = unlimited
 		maxRequestBytes:  maxReq,
+		connectSem:       make(chan struct{}, maxTunnels),
 	}
 
 	p.httpServer = &http.Server{

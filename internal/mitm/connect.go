@@ -87,6 +87,22 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound simultaneously-open tunnels. Each tunnel pins an fd, a TLS
+	// connection, and an http.Server goroutine for its lifetime; without a
+	// cap an authenticated actor (even at the lowest 'proxy' vault role) can
+	// open thousands of tunnels and exhaust the proxy for all tenants. The
+	// per-IP TierAuth gate doesn't help here — successful auth consumes no
+	// budget. Acquire before hijack so a 503 can still be written as HTTP.
+	if p.connectSem != nil {
+		select {
+		case p.connectSem <- struct{}{}:
+			defer func() { <-p.connectSem }()
+		default:
+			http.Error(w, "too many concurrent tunnels", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)

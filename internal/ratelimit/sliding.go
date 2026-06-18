@@ -7,8 +7,9 @@ import (
 
 // slidingWindow is a generic sliding-window limiter keyed by string.
 // It tracks timestamps of recent events per key, drops entries older
-// than window on every check, and evicts cold keys when the map grows
-// past maxKeys. Thread-safe.
+// than window on every check, and bounds the map at maxKeys: cold keys
+// are evicted first, then (if still over cap under a fresh-key spray)
+// the oldest entries are evicted unconditionally. Thread-safe.
 //
 // The struct fields are mutable at runtime so Registry.Reload can
 // change window/max without rebuilding the bucket map; in-flight keys
@@ -92,16 +93,7 @@ func (l *slidingWindow) allow(key string) Decision {
 
 	l.attempts[key] = append(l.attempts[key], now)
 
-	// Evict cold keys to prevent unbounded growth. Walk once looking
-	// for entries whose most-recent attempt is already outside the
-	// window — cheap and correct, matches the legacy limiter.
-	if l.maxKeys > 0 && len(l.attempts) > l.maxKeys {
-		for k, v := range l.attempts {
-			if len(v) == 0 || v[len(v)-1].Before(cutoff) {
-				delete(l.attempts, k)
-			}
-		}
-	}
+	l.evictIfNeededLocked(cutoff)
 
 	return AllowOK(l.max-len(recent)-1, l.max)
 }
@@ -135,15 +127,54 @@ func (l *slidingWindow) check(key string) Decision {
 		return Deny("rate", wait, l.max)
 	}
 
-	if l.maxKeys > 0 && len(l.attempts) > l.maxKeys {
-		for k, v := range l.attempts {
-			if len(v) == 0 || v[len(v)-1].Before(cutoff) {
-				delete(l.attempts, k)
-			}
-		}
-	}
+	l.evictIfNeededLocked(cutoff)
 
 	return AllowOK(l.max-len(recent), l.max)
+}
+
+// evictIfNeededLocked is called under l.mu. It first sweeps cold keys
+// (most-recent attempt already outside the window — zero fairness
+// impact). If the map is still over maxKeys — the adversarial case
+// where an attacker sprays distinct FRESH keys that are never cold — it
+// falls back to evicting the keys with the oldest most-recent attempt
+// until the map is within cap, so the map stays bounded regardless of
+// the timestamp distribution. Mirrors tokenBucketMap.evictIfNeededLocked.
+func (l *slidingWindow) evictIfNeededLocked(cutoff time.Time) {
+	if l.maxKeys <= 0 || len(l.attempts) <= l.maxKeys {
+		return
+	}
+	// Cold-key sweep first.
+	for k, v := range l.attempts {
+		if len(v) == 0 || v[len(v)-1].Before(cutoff) {
+			delete(l.attempts, k)
+		}
+		if len(l.attempts) <= l.maxKeys {
+			return
+		}
+	}
+	// Fallback: evict the entry with the oldest most-recent attempt until
+	// within cap. Bounds memory even when every key is fresh.
+	for len(l.attempts) > l.maxKeys {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, v := range l.attempts {
+			if len(v) == 0 {
+				oldestKey = k
+				break
+			}
+			last := v[len(v)-1]
+			if first || last.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = last
+				first = false
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(l.attempts, oldestKey)
+	}
 }
 
 // size returns the number of tracked keys (for gauges/tests).

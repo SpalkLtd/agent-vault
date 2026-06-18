@@ -136,6 +136,35 @@ func TestSlidingWindowEvictionCap(t *testing.T) {
 	}
 }
 
+func TestSlidingWindowBoundedUnderFreshKeySpray(t *testing.T) {
+	// SECURITY (HIGH): the cold-key sweep only evicts keys whose most-recent
+	// attempt is already outside the window. Under an adversarial spray of
+	// distinct FRESH keys (all within the window — e.g. unauthenticated
+	// invite/approval-token endpoints with attacker-varied tokens), no key is
+	// ever cold, so the map must be bounded by an unconditional fallback
+	// eviction. Without it the map grows to one entry per attacker request.
+	cfg := DefaultsFor(ProfileDefault)
+	cfg.Tiers[TierAuth].MaxKeys = 100
+	cfg.Tiers[TierAuth].Window = 5 * time.Minute // long: keys stay fresh
+	r := New(cfg)
+
+	const spray = 5000
+	for i := 0; i < spray; i++ {
+		r.Allow(TierAuth, fmt.Sprintf("ipt:1.2.3.4:%d", i))
+	}
+	if sz := r.sliding[TierAuth].size(); sz > cfg.Tiers[TierAuth].MaxKeys {
+		t.Fatalf("sliding map unbounded under fresh-key spray: size=%d, maxKeys=%d", sz, cfg.Tiers[TierAuth].MaxKeys)
+	}
+
+	// check() (the MITM pre-gate path) must be bounded too.
+	for i := 0; i < spray; i++ {
+		r.Check(TierAuth, fmt.Sprintf("mitm:5.6.7.8:%d", i))
+	}
+	if sz := r.sliding[TierAuth].size(); sz > cfg.Tiers[TierAuth].MaxKeys {
+		t.Fatalf("sliding map unbounded under fresh-key check() spray: size=%d, maxKeys=%d", sz, cfg.Tiers[TierAuth].MaxKeys)
+	}
+}
+
 func TestTokenBucketBurstAndRefill(t *testing.T) {
 	cfg := DefaultsFor(ProfileDefault)
 	// Force a tiny, predictable bucket.

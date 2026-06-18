@@ -34,6 +34,14 @@ const (
 	rootCommonName   = "Agent Vault Root CA"
 )
 
+// caKeyAAD is the AES-GCM associated-data domain that binds the encrypted CA
+// root key to its own slot. The CA key is sealed under the same DEK as
+// credentials; without domain separation the two blobs are interchangeable,
+// so a relocated CA-key blob could be decrypted (and exfiltrated) via the
+// credential-reveal path. This AAD makes the CA-key ciphertext openable only
+// here, never on the nil-AAD credential path.
+var caKeyAAD = []byte("agent-vault/ca-root-key/v1")
+
 var serialLimit = new(big.Int).Lsh(big.NewInt(1), 128)
 
 // Options configures a SoftCA. Zero values pick sensible defaults.
@@ -182,9 +190,20 @@ func (c *SoftCA) load(certPath, keyPath string, masterKey []byte) error {
 	if err != nil {
 		return fmt.Errorf("decoding ciphertext: %w", err)
 	}
-	keyDER, err := crypto.Decrypt(ciphertext, nonce, masterKey)
+	keyDER, err := crypto.Decrypt(ciphertext, nonce, masterKey, caKeyAAD)
 	if err != nil {
-		return fmt.Errorf("decrypting root key: %w", err)
+		// Backward compatibility: keys written before AAD domain separation
+		// were sealed with no AAD. Fall back, and if that succeeds migrate the
+		// on-disk blob to the AAD domain so it can no longer be opened on the
+		// credential-reveal (nil-AAD) path.
+		legacyDER, legacyErr := crypto.Decrypt(ciphertext, nonce, masterKey)
+		if legacyErr != nil {
+			return fmt.Errorf("decrypting root key: %w", err)
+		}
+		keyDER = legacyDER
+		if migErr := writeEncryptedKey(keyPath, keyDER, masterKey); migErr != nil {
+			return fmt.Errorf("migrating root key to AAD domain: %w", migErr)
+		}
 	}
 	key, err := x509.ParseECPrivateKey(keyDER)
 	if err != nil {
@@ -192,6 +211,26 @@ func (c *SoftCA) load(certPath, keyPath string, masterKey []byte) error {
 	}
 
 	c.setRoot(cert, key, certPEM)
+	return nil
+}
+
+// writeEncryptedKey seals keyDER under the CA AAD domain and atomically
+// writes the JSON key file at keyPath (mode 0600).
+func writeEncryptedKey(keyPath string, keyDER, masterKey []byte) error {
+	ciphertext, nonce, err := crypto.Encrypt(keyDER, masterKey, caKeyAAD)
+	if err != nil {
+		return fmt.Errorf("encrypting root key: %w", err)
+	}
+	blob, err := json.Marshal(encryptedKeyFile{
+		Nonce:      base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
+	})
+	if err != nil {
+		return fmt.Errorf("marshaling encrypted key: %w", err)
+	}
+	if err := writeAtomic(keyPath, blob, 0600); err != nil {
+		return fmt.Errorf("writing root key: %w", err)
+	}
 	return nil
 }
 
@@ -231,19 +270,8 @@ func (c *SoftCA) generate(certPath, keyPath string, masterKey []byte) error {
 	if err != nil {
 		return fmt.Errorf("marshaling root key: %w", err)
 	}
-	ciphertext, nonce, err := crypto.Encrypt(keyDER, masterKey)
-	if err != nil {
-		return fmt.Errorf("encrypting root key: %w", err)
-	}
-	blob, err := json.Marshal(encryptedKeyFile{
-		Nonce:      base64.StdEncoding.EncodeToString(nonce),
-		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
-	})
-	if err != nil {
-		return fmt.Errorf("marshaling encrypted key: %w", err)
-	}
-	if err := writeAtomic(keyPath, blob, 0600); err != nil {
-		return fmt.Errorf("writing root key: %w", err)
+	if err := writeEncryptedKey(keyPath, keyDER, masterKey); err != nil {
+		return err
 	}
 
 	c.setRoot(cert, key, certPEM)

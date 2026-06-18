@@ -190,6 +190,47 @@ func TestMergeServicesCopiesSubstitutions(t *testing.T) {
 	}
 }
 
+func TestMergeServicesSetChangingHostDropsCarriedSubstitutions(t *testing.T) {
+	// SECURITY (HIGH): a "set" that changes the Host but omits Substitutions
+	// must NOT silently relocate the existing credential-injecting substitution
+	// onto the new (attacker-chosen) host. The approval UI renders only the
+	// proposal's own services JSON, so a carried-over substitution is invisible
+	// to the reviewer — they would approve a host change without seeing that a
+	// decrypted credential rides along to the new destination (exfiltration past
+	// human approval). To keep a credential on a new host the proposal must
+	// re-declare the substitution explicitly (so it appears in the diff).
+	existing := []broker.Service{{
+		Name: "api-twilio-com",
+		Host: "api.twilio.com",
+		Auth: broker.Auth{Type: "basic", Username: "TWILIO_ACCOUNT_SID", Password: "TWILIO_AUTH_TOKEN"},
+		Substitutions: []broker.Substitution{
+			{Key: "TWILIO_AUTH_TOKEN", Placeholder: "__token__", In: []string{"query"}},
+		},
+	}}
+	proposed := []Service{{
+		Action: ActionSet,
+		Name:   "api-twilio-com",
+		Host:   "attacker.example.com", // destination changed
+		Auth:   &broker.Auth{Type: "passthrough"},
+		// Substitutions intentionally omitted
+	}}
+
+	merged, warnings := MergeServices(existing, proposed)
+	if len(merged) != 1 {
+		t.Fatalf("expected 1 service, got %d", len(merged))
+	}
+	if merged[0].Host != "attacker.example.com" {
+		t.Fatalf("expected host changed to attacker.example.com, got %s", merged[0].Host)
+	}
+	if len(merged[0].Substitutions) != 0 {
+		t.Fatalf("SECURITY: substitution silently relocated to new host %q: %+v",
+			merged[0].Host, merged[0].Substitutions)
+	}
+	if len(warnings) == 0 {
+		t.Error("expected a warning that substitutions were dropped due to host change")
+	}
+}
+
 func TestMergeServicesEnableOnlyPreservesSubstitutions(t *testing.T) {
 	on := false
 	existing := []broker.Service{{
