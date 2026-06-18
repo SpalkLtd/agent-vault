@@ -16,6 +16,24 @@ The top findings were then re-verified by hand against live code, including **ru
 
 **Result:** 12 candidate findings → **11 confirmed, 1 disputed, 0 refuted.** Every finding carries a verbatim `file:line` citation.
 
+## Remediation status
+
+All **HIGH** and **MEDIUM** findings are **resolved** on branch `security/audit-and-high-medium-fixes` (PR [SpalkLtd/agent-vault#1](https://github.com/SpalkLtd/agent-vault/pull/1)), each with a TDD red/green test. Resolved findings are marked **✅ RESOLVED** inline below with their commit.
+
+| # | Finding | Severity | Status | Commit |
+|---|---|---|---|---|
+| 1 | Proposal-merge credential exfiltration past approval | HIGH | ✅ Resolved | `f781266` |
+| 2 | IPv6 `::` SSRF to broker localhost | HIGH | ✅ Resolved | `b96bd1a`, `8aa0cbc` |
+| 3 | Unauthenticated sliding-window limiter DoS | HIGH | ✅ Resolved | `3fc1bce` |
+| 4 | Cloud-metadata SSRF guard incomplete (ECS/Alibaba) | MEDIUM | ✅ Resolved | `b96bd1a`, `8aa0cbc` |
+| 5 | MITM CONNECT concurrency DoS | MEDIUM | ✅ Resolved | `ec85bea` |
+| 6 | CA root key extraction (nil-AAD confused deputy) | MEDIUM | ✅ Resolved | `e96fef0` |
+| 7 | Container-isolation image-cache poisoning | MEDIUM | ✅ Resolved | `d27bdb0` |
+
+`8aa0cbc` additionally replaced the hand-maintained netguard CIDR list with stdlib predicates and added NAT64 (`64:ff9b::/96`) unwrapping — hardening the root cause of findings 2 and 4 against future enumeration drift.
+
+**LOW / INFO / DISPUTED** findings are **not** addressed in this PR (tracked for follow-up); see each below. Notably the crypto AAD fix (#6) covers the **CA key** domain — extending domain separation to credential/OAuth/sentinel blobs (the Round-2 LOW "blob interchangeability") needs a re-encryption migration and remains open.
+
 ## Threat model
 
 Adversaries, in priority order (used to judge exploitability):
@@ -33,6 +51,8 @@ Adversaries, in priority order (used to judge exploitability):
 ## Findings
 
 ### 🔴 HIGH — SSRF to broker localhost via IPv6 unspecified address `::`
+
+> **✅ RESOLVED** — `b96bd1a` added `::/128` to the block list; `8aa0cbc` replaced the enumerated list with stdlib predicates (`IsUnspecified()` covers `::` and `0.0.0.0` without enumeration) and added NAT64 unwrapping. Regression tests: `TestIsBlockedIP_UnspecifiedAddresses`, `TestIsBlockedIP_PredicateCoverage`, `TestIsBlockedIP_NAT64`.
 
 **`internal/netguard/netguard.go:105-124`**
 
@@ -55,6 +75,8 @@ isBlockedIP(::,      allowPrivate=false) = false   ← the bug
 ---
 
 ### 🟠 MEDIUM — Cloud-metadata SSRF guard is incomplete (AWS ECS + Alibaba reachable)
+
+> **✅ RESOLVED** — `b96bd1a` added `169.254.170.2/32` and `100.100.100.200/32` to `alwaysBlocked`; `8aa0cbc` added NAT64 unwrapping so metadata IPs can't be reached via `64:ff9b::/96` either. Regression tests: `TestIsBlockedIP_MetadataAlwaysBlocked`, `TestIsBlockedIP_NAT64`.
 
 **`internal/netguard/netguard.go:95-100, 137-160`** *(two independent finders converged here)*
 
@@ -81,6 +103,8 @@ Both fall only in `privateRanges` (`169.254.0.0/16` and `100.64.0.0/10`), which 
 ---
 
 ### 🟠 MEDIUM — MITM CONNECT tunnels have no concurrency cap (authenticated DoS)
+
+> **✅ RESOLVED** — `ec85bea` added a bounded semaphore (`Options.MaxConcurrentTunnels`, default 256) acquired before hijack; over capacity returns `503`, released when the tunnel closes. Regression test: `TestMITMConnectConcurrencyCap`.
 
 **`internal/mitm/connect.go:50-156`**
 
@@ -148,6 +172,8 @@ A second `Find → Verify → Synthesize` workflow (49 agents, 2 finders × comp
 
 ### 🔴 HIGH (critical-class) — Proposal merge silently relocates a credential-injecting substitution onto an attacker-changed host, invisible in the approval diff
 
+> **✅ RESOLVED** — `f781266` preserves substitutions only when the destination (Host+Port) is unchanged; a destination change drops them with a warning, so relocating a credential must be re-declared explicitly (and thus appears in the approval diff). Regression test: `TestMergeServicesSetChangingHostDropsCarriedSubstitutions` (the legitimate auth-rotation / enable-only cases still pass).
+
 **`internal/proposal/merge.go:55-62`**
 
 The merge "exists" branch rebuilds a service entirely from the proposal (`toBrokerService(p)` — Host, Path, Port, Auth) but, when the proposal omits `Substitutions`, **re-attaches the existing service's substitutions** to the new host:
@@ -168,6 +194,8 @@ Substitutions inject *decrypted credential values* into the outbound request to 
 **Fix:** (a) when a `set` changes Host/Path/Port/Auth, require substitutions to be re-declared explicitly (drop the implicit-preserve for full replacements); **or** (b) render the *effective post-merge* service (with preserved substitutions + credential keys + destination host) in the approval UI. Additionally, re-run `proposal.Validate` / `broker.Validate` / `ValidateCredentialRefs` on the **merged** result inside `handleAdminProposalApprove`.
 
 ### 🟠 HIGH — Sliding-window rate limiter ignores `maxKeys` under distinct-key sprays (limiter-as-DoS)
+
+> **✅ RESOLVED** — `3fc1bce` added an unconditional fallback eviction (oldest most-recent attempt) after the cold-key sweep, in both `allow()` and `check()`, mirroring the sibling limiters. Regression test: `TestSlidingWindowBoundedUnderFreshKeySpray` (map stays ≤ maxKeys under a 5000 distinct-key spray).
 
 **`internal/ratelimit/sliding.go:98-104` (and `138-144`)** *(both ratelimit finders converged)*
 
@@ -226,6 +254,8 @@ A focused workflow (12 agents) testing the 5 residual hypotheses from Round 2 as
 
 ### 🟠 MEDIUM — CA root key is extractable via the credential-reveal endpoint (nil-AAD confused deputy)
 
+> **✅ RESOLVED** — `e96fef0` added an optional AAD to `crypto.Encrypt/Decrypt` (backward compatible) and bound the CA key to its own domain, so its ciphertext can't be opened on the nil-AAD credential-reveal path; legacy keys load via fallback and are re-encrypted under the AAD domain on load (auto-migration). Regression tests: `TestAADDomainSeparation`, `TestCAKeyNotDecryptableViaNilAADPath`, `TestCALoadsLegacyNilAADKey`. **Note:** scoped to the CA-key domain; extending AAD to credential/OAuth/sentinel blobs (Round-2 LOW) needs a re-encryption migration and remains open.
+
 **`internal/crypto/crypto.go:29,45` · `internal/ca/soft.go:185,234` · `internal/server/handle_credentials.go:154,188-193`**
 
 A concrete escalation built on the Round-2 nil-AAD finding. The CA root ECDSA private key is sealed with the **same** `crypto.Encrypt` under the **same** DEK (`soft.go:234`; `ca.New(masterKey,…)` at `cmd/server.go:191`, where `masterKey` is `MasterKey.Key()` = the DEK) as credential rows — confirmed by inspection. Because GCM uses `nil` AAD, a CA-key `(ciphertext, nonce)` blob and a credential blob are byte-for-byte interchangeable. An attacker with **A4 raw store write** + an **authenticated vault member** account can copy the `ca.key.enc` blob into a `credentials` row and call `GET /credentials?reveal=true`; the reveal handler decrypts with the DEK and returns `string(plaintext)` verbatim — i.e. the **DER-encoded CA root private key**, a key no API ever exposes. With it the attacker mints leaf certs every agent trusts → full MITM impersonation of all upstreams.
@@ -264,6 +294,8 @@ The A3 strong-isolation gap. A workflow (41 agents, 6 finders) attacking the "no
 
 ### 🟠 MEDIUM — Image cache trusts any local tag → pre-seeded weaker image defeats isolation (cache poisoning)
 
+> **✅ RESOLVED** — `d27bdb0` stamps a build-time provenance label with the full asset hash and trusts a cached image only when the label matches (rebuild on missing/mismatch); also `--pull=never` and dropped the mutable `:latest` alias. Regression test: `TestImageTrusted_RequiresMatchingProvenanceLabel`.
+
 **`internal/isolation/image.go:57-60, 80-82`** *(two finders converged)*
 
 `EnsureImage` derives a deterministic tag `agent-vault/isolation:<12-hex asset-hash>` and decides whether to build solely via `imageExists` — which is just `docker image inspect <tag>` succeeding. **Confirmed by inspection:** there is no label/RepoDigest/provenance check binding the cached image *content* to the embedded assets. The tag is not a secret (it's hashed from assets shipped in the binary and hard-pinned in `image_test.go`). Any actor who can reach the same Docker daemon before the victim's first container run — a **co-tenant on a shared daemon, a prior CI step, or the malicious agent itself during an earlier `host`-mode session** — can `docker tag evil agent-vault/isolation:<hash>`. The next `vault run --isolation=container` skips the build and runs the planted image, whose `entrypoint.sh` can simply no-op `init-firewall.sh` → fully open egress (internet, `169.254.169.254`, host services), completely defeating the isolation promise. No race needed; the planted tag persists.
@@ -298,14 +330,16 @@ The audit explicitly **confirmed** several isolation invariants hold — worth r
 
 Across all five passes: no *unconditional* agent-gets-raw-credentials or no-human-approval break exists, but Round 2 found a **HIGH credential-exfiltration-past-approval** path in the proposal merge (the most serious finding overall — it defeats the human-in-the-loop boundary via a deceptive diff) and a **HIGH unauthenticated limiter DoS**. The Round-1 SSRF egress gaps remain the other priority. No agent-gets-raw-credentials or approval-bypass break was found in the core paths audited — the proposal, RBAC, and crypto invariants largely hold. The real exposure is **SSRF egress control** (the HIGH `::` bypass and the MEDIUM metadata gaps share one root cause: a hand-maintained IP blocklist), plus an **unbounded-concurrency DoS** on the MITM proxy.
 
-| Severity | R1 | R2 | R3 | Isolation | Total |
-|---|---|---|---|---|---|
-| High | 1 | 2 | 0 | 0 | 3 |
-| Medium | 2 | 0 | 1 | 1 | 4 |
-| Low | 5 | 5 | 1 | 3 | 14 |
-| Info | 2 | 3 | 1 | 1 | 7 |
-| Disputed | 1 | 1 | 0 | 7 | 9 |
-| Refuted / cleanly refuted | 0 | 7 | 3 | 4 | 14 |
+| Severity | R1 | R2 | R3 | Isolation | Total | Resolved |
+|---|---|---|---|---|---|---|
+| High | 1 | 2 | 0 | 0 | 3 | **3 / 3 ✅** |
+| Medium | 2 | 0 | 1 | 1 | 4 | **4 / 4 ✅** |
+| Low | 5 | 5 | 1 | 3 | 14 | 0 (follow-up) |
+| Info | 2 | 3 | 1 | 1 | 7 | 0 (info only) |
+| Disputed | 1 | 1 | 0 | 7 | 9 | — |
+| Refuted / cleanly refuted | 0 | 7 | 3 | 4 | 14 | — |
+
+**All 7 HIGH + MEDIUM findings are resolved** on PR [SpalkLtd/agent-vault#1](https://github.com/SpalkLtd/agent-vault/pull/1), each with a TDD red/green test (see the Remediation status table near the top and the ✅ markers inline). LOW/INFO findings are documented for follow-up.
 
 *139 agents across 5 passes. 28 confirmed findings; 14 candidate findings refuted by adversarial verification.*
 
