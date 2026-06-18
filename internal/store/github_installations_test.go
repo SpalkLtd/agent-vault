@@ -119,11 +119,15 @@ func TestGitHubAppInstallation_ListAndDelete(t *testing.T) {
 		t.Fatalf("expected 2 rows, got %d (%v)", len(rows), err)
 	}
 
-	if err := st.DeleteGitHubAppInstallation(ctx, vaultID, "GITHUB"); err != nil {
-		t.Fatalf("delete: %v", err)
+	if deleted, err := st.DeleteGitHubAppInstallation(ctx, vaultID, "GITHUB"); err != nil || !deleted {
+		t.Fatalf("delete: deleted=%v err=%v", deleted, err)
 	}
 	if _, err := st.GetGitHubAppInstallation(ctx, vaultID, "GITHUB"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected ErrNoRows after delete, got %v", err)
+	}
+	// Deleting a row that no longer exists reports deleted=false, no error.
+	if deleted, err := st.DeleteGitHubAppInstallation(ctx, vaultID, "GITHUB"); err != nil || deleted {
+		t.Fatalf("delete missing: deleted=%v err=%v", deleted, err)
 	}
 }
 
@@ -168,7 +172,7 @@ func TestGitHubAppInstallation_DBErrors(t *testing.T) {
 	if err := st.UpdateGitHubInstallationMintError(ctx, vaultID, "GITHUB", "x"); err == nil {
 		t.Fatalf("expected MintError error on closed DB")
 	}
-	if err := st.DeleteGitHubAppInstallation(ctx, vaultID, "GITHUB"); err == nil {
+	if _, err := st.DeleteGitHubAppInstallation(ctx, vaultID, "GITHUB"); err == nil {
 		t.Fatalf("expected Delete error on closed DB")
 	}
 }

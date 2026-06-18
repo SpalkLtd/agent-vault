@@ -148,13 +148,19 @@ func (s *SQLiteStore) UpdateGitHubInstallationMintError(ctx context.Context, vau
 	return err
 }
 
-// DeleteGitHubAppInstallation removes a credential's durable secret.
-func (s *SQLiteStore) DeleteGitHubAppInstallation(ctx context.Context, vaultID, key string) error {
-	_, err := s.db.ExecContext(ctx,
+// DeleteGitHubAppInstallation removes a credential's durable secret. It reports
+// whether a row was actually removed so callers can distinguish "deleted" from
+// "nothing to delete".
+func (s *SQLiteStore) DeleteGitHubAppInstallation(ctx context.Context, vaultID, key string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM github_app_installations WHERE vault_id = ? AND credential_key = ?`,
 		vaultID, key,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func parseNullableInstTime(s sql.NullString) *time.Time {

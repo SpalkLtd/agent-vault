@@ -1212,7 +1212,9 @@ func (m *mockStore) UpdateGitHubInstallationMeta(_ context.Context, _, _, _ stri
 func (m *mockStore) UpdateGitHubInstallationMintError(_ context.Context, _, _, _ string) error {
 	return nil
 }
-func (m *mockStore) DeleteGitHubAppInstallation(_ context.Context, _, _ string) error { return nil }
+func (m *mockStore) DeleteGitHubAppInstallation(_ context.Context, _, _ string) (bool, error) {
+	return false, nil
+}
 
 func TestHealthEndpoint(t *testing.T) {
 	srv := newTestServer()

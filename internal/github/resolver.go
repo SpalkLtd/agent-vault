@@ -250,8 +250,12 @@ func (r *Resolver) Validate(ctx context.Context, vaultID, key string) (string, e
 
 // EnumeratedCredential describes a configured GitHub credential for listing.
 type EnumeratedCredential struct {
-	Key       string
-	Identity  string // "<slug>[bot]" when known
+	Key      string
+	Identity string // "<slug>[bot]" when known
+	// Connected reports whether the credential has successfully minted at least
+	// once (connected_at is set), i.e. it is usable. A row that has a private key
+	// but never validated (e.g. a connect that failed at mint time) reports
+	// false, so the credential listing doesn't show it as available prematurely.
 	Connected bool
 }
 
@@ -267,7 +271,7 @@ func (r *Resolver) Enumerate(ctx context.Context, vaultID string) ([]EnumeratedC
 		if rows[i].AppSlug != "" {
 			id = rows[i].AppSlug + "[bot]"
 		}
-		out = append(out, EnumeratedCredential{Key: rows[i].CredentialKey, Identity: id, Connected: rows[i].Connected()})
+		out = append(out, EnumeratedCredential{Key: rows[i].CredentialKey, Identity: id, Connected: rows[i].ConnectedAt != nil})
 	}
 	return out, nil
 }

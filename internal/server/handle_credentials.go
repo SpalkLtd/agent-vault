@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -375,11 +377,29 @@ func (s *Server) handleCredentialsDelete(w http.ResponseWriter, r *http.Request)
 
 	var deleted []string
 	for _, key := range req.Keys {
-		if err := s.store.DeleteCredential(ctx, ns.ID, key); err != nil {
+		// A key may live in the static credentials table, the GitHub App
+		// installations table, or (rarely) both. Delete from both so a GitHub
+		// credential — whose durable App private key lives in its own table —
+		// is fully removed, not just its (absent) static row.
+		staticErr := s.store.DeleteCredential(ctx, ns.ID, key)
+		if staticErr != nil && !errors.Is(staticErr, sql.ErrNoRows) {
 			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete credential %q", key))
 			return
 		}
+		ghDeleted, ghErr := s.store.DeleteGitHubAppInstallation(ctx, ns.ID, key)
+		if ghErr != nil {
+			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to delete credential %q", key))
+			return
+		}
+		if errors.Is(staticErr, sql.ErrNoRows) && !ghDeleted {
+			jsonError(w, http.StatusNotFound, fmt.Sprintf("Credential %q not found", key))
+			return
+		}
 		deleted = append(deleted, key)
+	}
+	// Drop any in-memory ghs_ tokens for keys we just removed.
+	if s.githubDynamic != nil {
+		s.githubDynamic.EvictVault(ns.ID)
 	}
 
 	actor, _ := s.actorFromSession(r.Context(), sessionFromContext(r.Context()))

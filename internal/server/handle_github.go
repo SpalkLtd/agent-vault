@@ -78,6 +78,14 @@ func (s *Server) handleGitHubConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Connect always validates by minting, so the resolver must be available
+	// before we persist anything — otherwise a 503 would leave an unvalidated
+	// private key behind.
+	if s.githubDynamic == nil {
+		jsonError(w, http.StatusServiceUnavailable, "GitHub resolver not available")
+		return
+	}
+
 	pkCT, pkNonce, err := crypto.Encrypt([]byte(req.PrivateKey), s.encKey)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "Encryption failed")
@@ -96,17 +104,11 @@ func (s *Server) handleGitHubConnect(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to save GitHub configuration")
 		return
 	}
-	if s.githubDynamic != nil {
-		s.githubDynamic.EvictVault(ns.ID)
-	}
+	s.githubDynamic.EvictVault(ns.ID)
 
 	// Validate by minting once + capture the app slug. A failure here is an
 	// upstream/config problem (bad installation id, key not installed, GitHub
 	// down) — surface it as 502 so the operator fixes the App setup.
-	if s.githubDynamic == nil {
-		jsonError(w, http.StatusServiceUnavailable, "GitHub resolver not available")
-		return
-	}
 	slug, err := s.githubDynamic.Validate(ctx, ns.ID, req.Key)
 	if err != nil {
 		jsonError(w, http.StatusBadGateway, fmt.Sprintf("GitHub installation token mint failed during validation: %v", err))

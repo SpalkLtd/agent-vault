@@ -627,7 +627,7 @@ description: "Complete reference for all Agent Vault CLI commands."
     agent-vault vault credential delete <KEY> [KEY2 ...] [flags]
     ```
 
-    Delete one or more credentials. Alias: `agent-vault vault creds delete`. In agent mode (`AGENT_VAULT_TOKEN` set), `AGENT_VAULT_VAULT` (or `--vault`) is required — there is no project-file or interactive-picker fallback.
+    Delete one or more credentials. Alias: `agent-vault vault creds delete`. Removes static credentials as well as GitHub App installation credentials (`type: github`, including the stored App private key). In agent mode (`AGENT_VAULT_TOKEN` set), `AGENT_VAULT_VAULT` (or `--vault`) is required — there is no project-file or interactive-picker fallback.
 
     | Flag | Default | Description |
     |------|---------|-------------|

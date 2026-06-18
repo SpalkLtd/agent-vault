@@ -214,9 +214,37 @@ func TestValidateCapturesSlug(t *testing.T) {
 func TestEnumerate(t *testing.T) {
 	st := newStore(t)
 	vaultID := seedInstall(t, st, "GITHUB", true)
+	// A validated mint (connected_at set) makes the credential usable/available.
+	_ = st.UpdateGitHubInstallationMeta(context.Background(), vaultID, "GITHUB", "spalk-agent")
 	r := NewResolver(st, testEncKey, testLogger())
 	creds, err := r.Enumerate(context.Background(), vaultID)
 	if err != nil || len(creds) != 1 || creds[0].Key != "GITHUB" || !creds[0].Connected {
 		t.Fatalf("enumerate: %+v err=%v", creds, err)
+	}
+}
+
+// TestEnumerateConnectedReflectsValidation: a credential that has a private key
+// but has never minted successfully (no connected_at) must NOT report Connected
+// — otherwise the credential listing shows it as available before it works.
+func TestEnumerateConnectedReflectsValidation(t *testing.T) {
+	st := newStore(t)
+	vaultID := seedInstall(t, st, "GITHUB", true) // has key, never validated
+	r := NewResolver(st, testEncKey, testLogger())
+
+	creds, err := r.Enumerate(context.Background(), vaultID)
+	if err != nil || len(creds) != 1 {
+		t.Fatalf("enumerate: %+v err=%v", creds, err)
+	}
+	if creds[0].Connected {
+		t.Fatalf("unvalidated credential (no connected_at) must not report Connected")
+	}
+
+	// A successful mint records connected_at → now available.
+	if err := st.UpdateGitHubInstallationMeta(context.Background(), vaultID, "GITHUB", "spalk-agent"); err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	creds, _ = r.Enumerate(context.Background(), vaultID)
+	if !creds[0].Connected {
+		t.Fatalf("validated credential (connected_at set) should report Connected")
 	}
 }

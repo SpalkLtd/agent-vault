@@ -338,7 +338,7 @@ type Store interface {
 	SetGitHubAppInstallation(ctx context.Context, g *store.GitHubAppInstallation) error
 	UpdateGitHubInstallationMeta(ctx context.Context, vaultID, key, appSlug string) error
 	UpdateGitHubInstallationMintError(ctx context.Context, vaultID, key, errMsg string) error
-	DeleteGitHubAppInstallation(ctx context.Context, vaultID, key string) error
+	DeleteGitHubAppInstallation(ctx context.Context, vaultID, key string) (bool, error)
 
 	// Broker configs
 	GetBrokerConfig(ctx context.Context, vaultID string) (*store.BrokerConfig, error)

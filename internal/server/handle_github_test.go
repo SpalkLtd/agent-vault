@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -294,12 +295,16 @@ func TestHandleGitHubConnect_MoreBranches(t *testing.T) {
 		assertJSONError(t, rec, http.StatusInternalServerError, "Failed to save GitHub configuration")
 	})
 
-	t.Run("resolver unavailable", func(t *testing.T) {
-		srv, _, vaultID := ghTestServer(t)
+	t.Run("resolver unavailable does not persist", func(t *testing.T) {
+		srv, st, vaultID := ghTestServer(t)
 		srv.githubDynamic = nil
 		rec := httptest.NewRecorder()
 		srv.handleGitHubConnect(rec, scopedReq("POST", "/x", connectBody("myvault", "GITHUB", "1", "2", testPEM(t)), vaultID, "member"))
 		assertJSONError(t, rec, http.StatusServiceUnavailable, "resolver not available")
+		// The credential must not be written when we can't validate it.
+		if _, err := st.GetGitHubAppInstallation(context.Background(), vaultID, "GITHUB"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("connect must not persist when resolver unavailable, got %v", err)
+		}
 	})
 }
 
@@ -386,5 +391,29 @@ func TestEnumerateGitHubCredentials(t *testing.T) {
 	srv.githubDynamic = nil
 	if got := srv.enumerateGitHubCredentials(ctx, vaultID); got != nil {
 		t.Fatalf("nil resolver should yield nil, got %v", got)
+	}
+}
+
+// TestHandleCredentialsDelete_PurgesGitHub ensures deleting a credential also
+// removes its github_app_installations row (the durable App private key), not
+// just the static credentials table.
+func TestHandleCredentialsDelete_PurgesGitHub(t *testing.T) {
+	srv, st, vaultID := ghTestServer(t)
+	ctx := context.Background()
+	if err := st.SetGitHubAppInstallation(ctx, &store.GitHubAppInstallation{
+		VaultID: vaultID, CredentialKey: "GITHUB", AppID: "1", InstallationID: "2",
+		PrivateKeyCT: []byte("ct"), PrivateKeyNonce: []byte("n"),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]any{"vault": "myvault", "keys": []string{"GITHUB"}})
+	rec := httptest.NewRecorder()
+	srv.handleCredentialsDelete(rec, scopedReq("POST", "/x", body, vaultID, "member"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := st.GetGitHubAppInstallation(ctx, vaultID, "GITHUB"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected github installation purged on delete, got %v", err)
 	}
 }
